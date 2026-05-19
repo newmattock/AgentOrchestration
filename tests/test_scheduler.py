@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,80 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_scheduled_task_dequeues_original_payload_on_target_queue(self):
+        task_id = self.scheduler.schedule(
+            {"type": "delayed"},
+            delay=0,
+            queue="critical",
+            priority=7,
+        )
+
+        import asyncio
+        assert asyncio.run(self.scheduler.dequeue("default")) is None
+        task = asyncio.run(self.scheduler.dequeue("critical"))
+
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["type"] == "delayed"
+        assert task["priority"] == 7
+        assert task["lifecycle"] == "in_flight"
+        assert self.scheduler.complete(task_id)
+
+    def test_reschedule_rejects_stale_generation_without_duplicate_dispatch(
+        self,
+    ):
+        task_id = self.scheduler.schedule(
+            {"type": "delayed"},
+            delay=60,
+            priority=3,
+        )
+        generation = self.scheduler._scheduled[task_id].generation
+
+        assert self.scheduler.reschedule(
+            task_id,
+            delay=0,
+            expected_generation=generation,
+        )
+        assert not self.scheduler.reschedule(
+            task_id,
+            delay=0,
+            expected_generation=generation,
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is not None
+        assert task["id"] == task_id
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        assert self.scheduler.audit_records[1] == {
+            "event": "reschedule_rejected",
+            "task_id": task_id,
+            "reason": "stale_generation",
+            "generation": 1,
+            "lifecycle": "scheduled",
+        }
+
+    def test_reschedule_rejects_in_flight_task_without_changing_lifecycle(
+        self,
+    ):
+        task_id = self.scheduler.schedule({"type": "delayed"}, delay=0)
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["lifecycle"] == "in_flight"
+        assert not self.scheduler.reschedule(task_id, delay=0)
+        assert task_id in self.scheduler._in_flight
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        assert self.scheduler.audit_records[-1] == {
+            "event": "reschedule_rejected",
+            "task_id": task_id,
+            "reason": "invalid_lifecycle",
+            "lifecycle": "in_flight",
+        }
 
 # 2019-01-09T19:07:03 update
 

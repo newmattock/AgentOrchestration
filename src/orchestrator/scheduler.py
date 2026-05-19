@@ -1,9 +1,9 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -30,14 +30,30 @@ class PriorityQueue:
         return len(self._queue)
 
 
+@dataclass
+class ScheduledTask:
+    task: Dict
+    due_at: float
+    queue: str
+    priority: int
+    generation: int
+    lifecycle: str = "scheduled"
+
+
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, ScheduledTask] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._audit_records: List[Dict] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,23 +64,115 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["retries"] = task.get("retries", 0)
+        self._scheduled[task_id] = ScheduledTask(
+            task=task,
+            due_at=time.time() + delay,
+            queue=queue,
+            priority=priority,
+            generation=0,
+        )
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def reschedule(
+        self,
+        task_id: str,
+        delay: float,
+        queue: Optional[str] = None,
+        priority: Optional[int] = None,
+        expected_generation: Optional[int] = None,
+        expected_revision: Optional[int] = None,
+    ) -> bool:
+        scheduled = self._scheduled.get(task_id)
+        if scheduled is None:
+            lifecycle = (
+                "in_flight" if task_id in self._in_flight else "missing"
+            )
+            self._audit(
+                "reschedule_rejected",
+                task_id,
+                "invalid_lifecycle",
+                lifecycle=lifecycle,
+            )
+            return False
+        expected = (
+            expected_revision
+            if expected_revision is not None
+            else expected_generation
+        )
+        if expected is not None and scheduled.generation != expected:
+            self._audit(
+                "reschedule_rejected",
+                task_id,
+                "stale_generation",
+                generation=scheduled.generation,
+                lifecycle=scheduled.lifecycle,
+            )
+            return False
+
+        self._scheduled[task_id] = ScheduledTask(
+            task=scheduled.task,
+            due_at=time.time() + delay,
+            queue=queue if queue is not None else scheduled.queue,
+            priority=priority if priority is not None else scheduled.priority,
+            generation=scheduled.generation + 1,
+            lifecycle="scheduled",
+        )
+        self._audit(
+            "reschedule_accepted",
+            task_id,
+            "scheduled",
+            generation=scheduled.generation + 1,
+            lifecycle="scheduled",
+        )
+        return True
+
+    @property
+    def audit_records(self) -> List[Dict]:
+        return list(self._audit_records)
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+        expired = [
+            (tid, scheduled.generation)
+            for tid, scheduled in self._scheduled.items()
+            if scheduled.queue == queue and scheduled.due_at <= now
+        ]
+        for tid, generation in expired:
+            scheduled = self._scheduled.get(tid)
+            if scheduled is None or scheduled.generation != generation:
+                continue
+            self._scheduled.pop(tid)
+            self._enqueue_existing(
+                scheduled.task,
+                scheduled.queue,
+                scheduled.priority,
+            )
+            self._audit(
+                "scheduled_task_ready",
+                tid,
+                "delay_elapsed",
+                generation=generation,
+                lifecycle="ready",
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                task["lifecycle"] = "in_flight"
                 self._in_flight[task["id"]] = task
                 return task
         return None
@@ -80,6 +188,34 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def _enqueue_existing(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int = 0,
+    ) -> None:
+        task["enqueued_at"] = time.time()
+        task["priority"] = priority
+        task["lifecycle"] = "ready"
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._queues[queue].push(task, priority)
+
+    def _audit(
+        self,
+        event: str,
+        task_id: str,
+        reason: str,
+        **details: Any,
+    ) -> None:
+        record = {
+            "event": event,
+            "task_id": task_id,
+            "reason": reason,
+        }
+        record.update(details)
+        self._audit_records.append(record)
 
 # 2019-04-25T08:37:12 update
 
