@@ -1,5 +1,9 @@
 import pytest
-from src.agent.registry import AgentRegistry, AgentStatus
+from src.agent.registry import (
+    AgentRegistry,
+    AgentStatus,
+    RegistryAuthorizationError,
+)
 
 
 class TestAgentRegistry:
@@ -47,6 +51,105 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_authorized_resolution_rechecks_after_permission_change(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {
+                "permissions": ["tasks.dispatch"],
+                "secret_token": "private-runtime-token",
+            },
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        resolved = self.registry.resolve_authorized(agent_id, "tasks.dispatch")
+        assert resolved["id"] == agent_id
+        assert self.registry.authorization_cache_size() == 1
+
+        assert self.registry.update_permissions(agent_id, [])
+        assert self.registry.authorization_cache_size() == 0
+
+        with pytest.raises(RegistryAuthorizationError):
+            self.registry.resolve_authorized(agent_id, "tasks.dispatch")
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.RUNNING.value
+        assert agent["config"]["permissions"] == []
+        assert self.registry.authorization_cache_size() == 0
+
+        audit_text = repr(self.registry.authorization_audit_log())
+        assert "private-runtime-token" not in audit_text
+        assert "cache_invalidated" in audit_text
+        assert "permission_missing" in audit_text
+
+    def test_principal_authorization_cache_rechecks_after_policy_change(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {
+                "authorization": {
+                    "alice@example.com": ["tasks.dispatch"],
+                    "bob@example.com": ["tasks.inspect"],
+                },
+                "secret_token": "private-runtime-token",
+            },
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        resolved = self.registry.resolve_authorized(
+            agent_id,
+            "tasks.dispatch",
+            principal_id="alice@example.com",
+        )
+        assert resolved["id"] == agent_id
+        assert self.registry.authorization_cache_size() == 1
+
+        with pytest.raises(RegistryAuthorizationError):
+            self.registry.resolve_authorized(
+                agent_id,
+                "tasks.dispatch",
+                principal_id="bob@example.com",
+            )
+
+        assert self.registry.update_authorization_policy(
+            agent_id,
+            {"alice@example.com": [], "bob@example.com": ["tasks.inspect"]},
+        )
+        assert self.registry.authorization_cache_size() == 0
+
+        with pytest.raises(RegistryAuthorizationError):
+            self.registry.resolve_authorized(
+                agent_id,
+                "tasks.dispatch",
+                principal_id="alice@example.com",
+            )
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.RUNNING.value
+
+        audit_text = repr(self.registry.authorization_audit_log())
+        assert "private-runtime-token" not in audit_text
+        assert "alice@example.com" not in audit_text
+        assert "bob@example.com" not in audit_text
+        assert "authorization_policy_updated" in audit_text
+        assert "permission_missing" in audit_text
+
+    def test_register_rejects_malformed_permission_config(self):
+        with pytest.raises(ValueError):
+            self.registry.register(
+                "test-agent",
+                "worker.processor",
+                {"permissions": "tasks.dispatch"},
+            )
+
+    def test_register_rejects_malformed_authorization_policy(self):
+        with pytest.raises(ValueError):
+            self.registry.register(
+                "test-agent",
+                "worker.processor",
+                {"authorization": {"alice@example.com": "tasks.dispatch"}},
+            )
 
 # 2019-01-23T10:28:57 update
 

@@ -1,10 +1,10 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
+import hashlib
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
 class AgentStatus(Enum):
@@ -16,36 +16,72 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+class RegistryAuthorizationError(PermissionError):
+    """Raised when an agent resolution fails the current permission policy."""
+
+
+DEFAULT_PRINCIPAL = "__agent__"
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._auth_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._audit_log: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
+        agent_config = dict(config or {})
+        permissions = self._normalize_permissions(
+            agent_config.get("permissions", [])
+        )
+        agent_config["permissions"] = sorted(permissions)
+        authorization_policy = self._normalize_authorization_policy(
+            agent_config.get("authorization")
+        )
+        if DEFAULT_PRINCIPAL not in authorization_policy:
+            authorization_policy[DEFAULT_PRINCIPAL] = set(permissions)
         self._agents[agent_id] = {
             "id": agent_id,
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": agent_config,
+            "authorization_policy": authorization_policy,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
+            "auth_version": 1,
             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
         }
         group = agent_type.split(".")[0]
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._record_auth_audit(
+            "registered",
+            agent_id,
+            decision="allow",
+            reason="permissions_validated",
+        )
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -65,6 +101,7 @@ class AgentRegistry:
         if agent_id not in self._agents:
             return False
         agent = self._agents.pop(agent_id)
+        self.invalidate_authorization_cache(agent_id=agent_id)
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
@@ -72,6 +109,237 @@ class AgentRegistry:
 
     def count(self) -> int:
         return len(self._agents)
+
+    def update_permissions(
+        self,
+        agent_id: str,
+        permissions: Iterable[str],
+    ) -> bool:
+        if agent_id not in self._agents:
+            return False
+        normalized = self._normalize_permissions(permissions)
+        agent = self._agents[agent_id]
+        agent["config"]["permissions"] = sorted(normalized)
+        agent["authorization_policy"][DEFAULT_PRINCIPAL] = set(normalized)
+        agent["auth_version"] += 1
+        agent["updated_at"] = time.time()
+        invalidated = self.invalidate_authorization_cache(agent_id=agent_id)
+        self._record_auth_audit(
+            "permissions_updated",
+            agent_id,
+            decision="allow",
+            reason="cache_invalidated",
+            invalidated=invalidated,
+        )
+        return True
+
+    def update_authorization_policy(
+        self,
+        agent_id: str,
+        policy: Dict[str, Iterable[str]],
+    ) -> bool:
+        if agent_id not in self._agents:
+            return False
+        normalized = self._normalize_authorization_policy(policy)
+        agent = self._agents[agent_id]
+        agent["authorization_policy"] = normalized
+        agent["config"]["authorization"] = {
+            principal: sorted(permissions)
+            for principal, permissions in normalized.items()
+        }
+        agent["auth_version"] += 1
+        agent["updated_at"] = time.time()
+        invalidated = self.invalidate_authorization_cache(agent_id=agent_id)
+        self._record_auth_audit(
+            "authorization_policy_updated",
+            agent_id,
+            decision="allow",
+            reason="cache_invalidated",
+            invalidated=invalidated,
+        )
+        return True
+
+    def resolve_authorized(
+        self,
+        agent_id: str,
+        permission: str,
+        principal_id: str = DEFAULT_PRINCIPAL,
+    ) -> Dict[str, Any]:
+        permission = self._normalize_permission(permission)
+        principal_id = self._normalize_principal(principal_id)
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            self._record_auth_audit(
+                "resolve",
+                agent_id,
+                permission=permission,
+                principal_id=principal_id,
+                decision="deny",
+                reason="agent_missing",
+            )
+            raise RegistryAuthorizationError("agent is not registered")
+
+        cache_key = (agent_id, principal_id, permission)
+        cached = self._auth_cache.get(cache_key)
+        if cached and cached["auth_version"] == agent["auth_version"]:
+            if self._agent_allows(agent, principal_id, permission):
+                self._record_auth_audit(
+                    "resolve",
+                    agent_id,
+                    permission=permission,
+                    principal_id=principal_id,
+                    decision="allow",
+                    reason="cache_hit",
+                )
+                return agent
+            self._auth_cache.pop(cache_key, None)
+        elif cached:
+            self._auth_cache.pop(cache_key, None)
+            self._record_auth_audit(
+                "resolve",
+                agent_id,
+                permission=permission,
+                principal_id=principal_id,
+                decision="defer",
+                reason="permission_changed",
+            )
+
+        if not self._agent_allows(agent, principal_id, permission):
+            self._record_auth_audit(
+                "resolve",
+                agent_id,
+                permission=permission,
+                principal_id=principal_id,
+                decision="deny",
+                reason="permission_missing",
+            )
+            raise RegistryAuthorizationError(
+                f"agent {agent_id} is not authorized for {permission}"
+            )
+
+        self._auth_cache[cache_key] = {
+            "agent_id": agent_id,
+            "principal_hash": self._principal_hash(principal_id),
+            "permission": permission,
+            "auth_version": agent["auth_version"],
+        }
+        self._record_auth_audit(
+            "resolve",
+            agent_id,
+            permission=permission,
+            principal_id=principal_id,
+            decision="allow",
+            reason="policy_check",
+        )
+        return agent
+
+    def invalidate_authorization_cache(
+        self,
+        agent_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        permission: Optional[str] = None,
+    ) -> int:
+        normalized_principal = None
+        if principal_id is not None:
+            normalized_principal = self._normalize_principal(principal_id)
+        normalized_permission = None
+        if permission is not None:
+            normalized_permission = self._normalize_permission(permission)
+        keys = [
+            key for key in self._auth_cache
+            if (agent_id is None or key[0] == agent_id)
+            and (
+                normalized_principal is None
+                or key[1] == normalized_principal
+            )
+            and (
+                normalized_permission is None
+                or key[2] == normalized_permission
+            )
+        ]
+        for key in keys:
+            self._auth_cache.pop(key, None)
+        return len(keys)
+
+    def authorization_cache_size(self) -> int:
+        return len(self._auth_cache)
+
+    def authorization_audit_log(self) -> List[Dict[str, Any]]:
+        return [dict(entry) for entry in self._audit_log]
+
+    def _agent_allows(
+        self,
+        agent: Dict[str, Any],
+        principal_id: str,
+        permission: str,
+    ) -> bool:
+        policy = agent.get("authorization_policy", {})
+        permissions = set(policy.get(principal_id, set()))
+        return "*" in permissions or permission in permissions
+
+    def _normalize_authorization_policy(
+        self,
+        policy: Optional[Dict[str, Iterable[str]]],
+    ) -> Dict[str, Set[str]]:
+        if policy is None:
+            return {}
+        if not isinstance(policy, dict):
+            raise ValueError("authorization policy must be a mapping")
+        return {
+            self._normalize_principal(principal): self._normalize_permissions(
+                permissions
+            )
+            for principal, permissions in policy.items()
+        }
+
+    def _normalize_permissions(self, permissions: Iterable[str]) -> Set[str]:
+        if isinstance(permissions, str):
+            raise ValueError(
+                "permissions must be an iterable of permission strings"
+            )
+        return {
+            self._normalize_permission(permission)
+            for permission in permissions
+        }
+
+    def _normalize_permission(self, permission: str) -> str:
+        if not isinstance(permission, str) or not permission.strip():
+            raise ValueError("permission must be a non-empty string")
+        return permission.strip()
+
+    def _normalize_principal(self, principal_id: str) -> str:
+        if not isinstance(principal_id, str) or not principal_id.strip():
+            raise ValueError("principal_id must be a non-empty string")
+        return principal_id.strip()
+
+    def _principal_hash(self, principal_id: str) -> str:
+        return hashlib.sha256(principal_id.encode("utf-8")).hexdigest()[:12]
+
+    def _record_auth_audit(
+        self,
+        event: str,
+        agent_id: str,
+        *,
+        decision: str,
+        reason: str,
+        permission: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        invalidated: Optional[int] = None,
+    ) -> None:
+        entry: Dict[str, Any] = {
+            "event": event,
+            "agent_id": agent_id,
+            "decision": decision,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if permission is not None:
+            entry["permission"] = permission
+        if principal_id is not None:
+            entry["principal_hash"] = self._principal_hash(principal_id)
+        if invalidated is not None:
+            entry["invalidated"] = invalidated
+        self._audit_log.append(entry)
 
 # 2019-01-29T11:24:49 update
 
