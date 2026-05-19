@@ -1,22 +1,31 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, Depends, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from .auth import OperatorPrincipal, require_run_cancel_principal
+from .run_cancellation import run_cancellations
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +62,27 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/workspaces/{workspace_id}/runs/{run_id}/cancel")
+async def cancel_run(
+    workspace_id: str,
+    run_id: str,
+    principal: OperatorPrincipal = Depends(require_run_cancel_principal),
+):
+    cancellation = run_cancellations.cancel(
+        run_id=run_id,
+        workspace_id=workspace_id,
+        principal=principal,
+    )
+    if not cancellation:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {
+        "status": cancellation.status,
+        "run_id": cancellation.run_id,
+        "workspace_id": cancellation.workspace_id,
+        "cancelled_by": cancellation.cancelled_by,
+    }
 
 # 2019-03-18T11:10:18 update
 
