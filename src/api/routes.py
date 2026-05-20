@@ -1,22 +1,31 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.webhooks import WebhookDispatchController, WebhookDispatchError
 
 router = APIRouter()
 registry = AgentRegistry()
+webhook_controller = WebhookDispatchController()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +62,56 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/webhooks/endpoints")
+async def register_webhook_endpoint(
+    workspace_id: str,
+    endpoint_id: str,
+    url: str,
+    limit_per_window: int = 60,
+    window_seconds: int = 60,
+    enabled: bool = True,
+):
+    try:
+        return webhook_controller.register_endpoint(
+            workspace_id,
+            endpoint_id,
+            url,
+            limit_per_window=limit_per_window,
+            window_seconds=window_seconds,
+            enabled=enabled,
+        )
+    except WebhookDispatchError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/webhooks/endpoints/{endpoint_id}/fanout")
+async def dispatch_webhook(
+    endpoint_id: str,
+    workspace_id: str,
+    event_id: str,
+    payload: Optional[Dict] = None,
+    idempotency_key: Optional[str] = None,
+):
+    try:
+        result = webhook_controller.dispatch(
+            workspace_id,
+            endpoint_id,
+            event_id,
+            payload or {},
+            idempotency_key=idempotency_key,
+        )
+    except WebhookDispatchError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if result["status"] == "rejected":
+        status_code = 429
+        if result["reason"] == "endpoint_not_found":
+            status_code = 404
+        elif result["reason"] == "endpoint_disabled":
+            status_code = 409
+        raise HTTPException(status_code=status_code, detail=result)
+    return result
 
 # 2019-03-18T11:10:18 update
 
