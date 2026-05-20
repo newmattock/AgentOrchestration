@@ -7,6 +7,8 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from src.api.middleware import (
+    AUDIT_ACTOR_HEADER,
+    AUDIT_STATUS_HEADER,
     AuditMiddleware,
     AuthMiddleware,
     get_current_audit_actor,
@@ -44,17 +46,20 @@ def test_audit_actor_attaches_only_after_successful_auth():
 
     response = build_client(handler).get(
         "/api/v2/workflows",
-        headers={"Authorization": f"Bearer {SECRET_TOKEN}"},
+        headers={
+            "Authorization": f"Bearer {SECRET_TOKEN}",
+            "X-Audit-Actor": "user-123",
+        },
     )
 
     assert response.status_code == 200
-    assert response.headers["X-Audit-Status"] == "attached"
-    assert response.headers["X-Audit-Actor"].startswith("bearer:")
-    assert SECRET_TOKEN not in response.headers["X-Audit-Actor"]
+    assert response.headers[AUDIT_STATUS_HEADER] == "attached"
+    assert response.headers[AUDIT_ACTOR_HEADER] == "user-123"
+    assert SECRET_TOKEN not in response.headers[AUDIT_ACTOR_HEADER]
     assert seen_actors == [
         (
-            response.headers["X-Audit-Actor"],
-            response.headers["X-Audit-Actor"],
+            response.headers[AUDIT_ACTOR_HEADER],
+            response.headers[AUDIT_ACTOR_HEADER],
         ),
     ]
     assert get_current_audit_actor() is None
@@ -74,10 +79,53 @@ def test_rejected_request_does_not_attach_actor_or_call_handler():
     )
 
     assert response.status_code == 401
-    assert response.headers["X-Audit-Status"] == "rejected"
-    assert "X-Audit-Actor" not in response.headers
+    assert response.headers[AUDIT_STATUS_HEADER] == "rejected"
+    assert AUDIT_ACTOR_HEADER not in response.headers
     assert not called
     assert SECRET_TOKEN not in response.text
+    assert get_current_audit_actor() is None
+
+
+def test_invalid_explicit_actor_fails_closed_before_handler():
+    called = False
+
+    async def handler(request):
+        nonlocal called
+        called = True
+        return PlainTextResponse("should not run")
+
+    response = build_client(handler).get(
+        "/api/v2/workflows",
+        headers={
+            "Authorization": f"Bearer {SECRET_TOKEN}",
+            "X-Audit-Actor": "bad actor with spaces",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.headers[AUDIT_STATUS_HEADER] == "rejected"
+    assert AUDIT_ACTOR_HEADER not in response.headers
+    assert not called
+    assert SECRET_TOKEN not in response.text
+    assert get_current_audit_actor() is None
+
+
+def test_missing_explicit_actor_uses_non_secret_token_digest():
+    seen_actors = []
+
+    async def handler(request):
+        seen_actors.append(get_current_audit_actor())
+        return PlainTextResponse("ok")
+
+    response = build_client(handler).get(
+        "/api/v2/workflows",
+        headers={"Authorization": f"Bearer {SECRET_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers[AUDIT_ACTOR_HEADER].startswith("bearer:")
+    assert SECRET_TOKEN not in response.headers[AUDIT_ACTOR_HEADER]
+    assert seen_actors == [response.headers[AUDIT_ACTOR_HEADER]]
     assert get_current_audit_actor() is None
 
 

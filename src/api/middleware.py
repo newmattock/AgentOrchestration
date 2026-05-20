@@ -3,6 +3,7 @@
 import hashlib
 import time
 import logging
+import re
 from contextvars import ContextVar
 from typing import Callable, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -17,6 +18,9 @@ _audit_actor: ContextVar[Optional[str]] = ContextVar(
 )
 PROTECTED_API_PREFIX = "/api/v2"
 AUTH_TOKEN_PATH = "/api/v2/auth/token"
+AUDIT_ACTOR_HEADER = "X-Audit-Actor"
+AUDIT_STATUS_HEADER = "X-Audit-Status"
+SAFE_AUDIT_ACTOR_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
 
 
 def get_current_audit_actor() -> Optional[str]:
@@ -41,6 +45,22 @@ def _actor_from_authorization(authorization: str) -> Optional[str]:
     return f"bearer:{digest}"
 
 
+def _actor_from_request(request: Request) -> Optional[str]:
+    actor = (
+        request.headers.get(AUDIT_ACTOR_HEADER)
+        or request.headers.get("X-Actor-Id")
+        or request.headers.get("X-User-Id")
+    )
+    if actor is None:
+        return _actor_from_authorization(
+            request.headers.get("Authorization", ""),
+        )
+    actor = actor.strip()
+    if not SAFE_AUDIT_ACTOR_RE.fullmatch(actor):
+        return None
+    return actor
+
+
 def _clear_audit_state(request: Request) -> None:
     for attr in ("authenticated_actor", "audit_actor"):
         if hasattr(request.state, attr):
@@ -51,7 +71,15 @@ def _audit_rejected_response() -> Response:
     return Response(
         status_code=401,
         content="Unauthorized",
-        headers={"X-Audit-Status": "rejected"},
+        headers={AUDIT_STATUS_HEADER: "rejected"},
+    )
+
+
+def _invalid_actor_response() -> Response:
+    return Response(
+        status_code=400,
+        content="Invalid audit actor",
+        headers={AUDIT_STATUS_HEADER: "rejected"},
     )
 
 
@@ -62,12 +90,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
         call_next: Callable,
     ) -> Response:
         if _protected_api_request(request):
-            actor = _actor_from_authorization(
-                request.headers.get("Authorization", ""),
-            )
-            if not actor:
+            authorization = request.headers.get("Authorization", "")
+            if not _actor_from_authorization(authorization):
                 _clear_audit_state(request)
                 return _audit_rejected_response()
+            actor = _actor_from_request(request)
+            if not actor:
+                _clear_audit_state(request)
+                return _invalid_actor_response()
             request.state.authenticated_actor = actor
         try:
             return await call_next(request)
@@ -99,8 +129,8 @@ class AuditMiddleware(BaseHTTPMiddleware):
 
             response = await call_next(request)
             if actor:
-                response.headers["X-Audit-Actor"] = actor
-                response.headers["X-Audit-Status"] = "attached"
+                response.headers[AUDIT_ACTOR_HEADER] = actor
+                response.headers[AUDIT_STATUS_HEADER] = "attached"
             return response
         except Exception:
             logger.exception(
