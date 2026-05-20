@@ -12,12 +12,17 @@ from src.storage.artifacts import (
 )
 
 
-def compressed_artifact(artifact_id, content, digest=None):
+_DEFAULT_DIGEST = object()
+
+
+def compressed_artifact(artifact_id, content, digest=_DEFAULT_DIGEST):
     raw = content.encode("utf-8")
+    if digest is _DEFAULT_DIGEST:
+        digest = hashlib.sha256(raw).hexdigest()
     return CompressedArtifact(
         metadata=ArtifactMetadata(
             artifact_id=artifact_id,
-            digest=digest or hashlib.sha256(raw).hexdigest(),
+            digest=digest,
         ),
         payload=gzip.compress(raw),
     )
@@ -75,6 +80,25 @@ class TestArtifactBackupValidator:
                 artifact_id="artifact-3",
                 ok=False,
                 reason="digest_mismatch",
+            )
+        ]
+
+    def test_missing_metadata_digest_marks_backup_validation_failed(self):
+        artifact = compressed_artifact(
+            "artifact-missing-digest",
+            "payload",
+            digest="",
+        )
+
+        result = validate_compressed_artifact_backup([artifact])
+
+        assert not result.ok
+        assert result.checked_count == 1
+        assert result.failures == [
+            RestoreCheck(
+                artifact_id="artifact-missing-digest",
+                ok=False,
+                reason="missing_digest",
             )
         ]
 

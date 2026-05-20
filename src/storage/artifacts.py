@@ -135,9 +135,20 @@ class ArtifactBackupValidator:
                 reason=f"decompression_failed:{exc.__class__.__name__}",
             )
 
+        expected_digest = metadata.digest
+        if not isinstance(expected_digest, str) or not expected_digest.strip():
+            return RestoreCheck(
+                artifact_id=metadata.artifact_id,
+                ok=False,
+                reason="missing_digest",
+            )
+
         digest = self._digest_factory()
         digest.update(restored)
-        if not hmac.compare_digest(digest.hexdigest(), metadata.digest):
+        if not hmac.compare_digest(
+            digest.hexdigest(),
+            expected_digest.strip(),
+        ):
             return RestoreCheck(
                 artifact_id=metadata.artifact_id,
                 ok=False,
