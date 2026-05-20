@@ -29,3 +29,62 @@ def test_engine_persists_completion_before_post_execute_hooks():
     assert observed["outcome"]["status"] == "completed"
     assert observed["in_flight"] is False
     assert observed["result"] == outcome["result"]
+
+
+def test_engine_persists_exhausted_failure_before_on_error_hooks():
+    engine = OrchestrationEngine()
+    engine.scheduler._max_retries = 1
+    task_id = engine.scheduler.enqueue({
+        "type": "run",
+        "target_agent": "missing-agent",
+    })
+    task = asyncio.run(engine.scheduler.dequeue())
+    observed = {}
+
+    async def on_error(task, error):
+        observed["outcome"] = engine.scheduler.terminal_outcome(task["id"])
+        observed["in_flight"] = engine.scheduler.is_in_flight(task["id"])
+        observed["error"] = str(error)
+
+    engine.register_hook("on_error", on_error)
+
+    asyncio.run(engine._execute_task(task))
+
+    outcome = engine.scheduler.terminal_outcome(task_id)
+    assert outcome["status"] == "failed"
+    assert outcome["error"] == "Agent missing-agent not found"
+    assert observed["outcome"]["task_id"] == task_id
+    assert observed["outcome"]["status"] == "failed"
+    assert observed["in_flight"] is False
+    assert observed["error"] == outcome["error"]
+
+
+def test_engine_hook_failure_cannot_overwrite_persisted_completion():
+    engine = OrchestrationEngine()
+    agent_id = engine.registry.register("worker", "runtime.worker")
+    task_id = engine.scheduler.enqueue({
+        "type": "run",
+        "target_agent": agent_id,
+    })
+    task = asyncio.run(engine.scheduler.dequeue())
+    observed = {}
+
+    async def post_execute(task, result):
+        raise RuntimeError("side effect failed")
+
+    async def on_error(task, error):
+        observed["outcome"] = engine.scheduler.terminal_outcome(task["id"])
+        observed["in_flight"] = engine.scheduler.is_in_flight(task["id"])
+        observed["error"] = str(error)
+
+    engine.register_hook("post_execute", post_execute)
+    engine.register_hook("on_error", on_error)
+
+    asyncio.run(engine._execute_task(task))
+
+    outcome = engine.scheduler.terminal_outcome(task_id)
+    assert outcome["status"] == "completed"
+    assert outcome["result"]["status"] == "completed"
+    assert observed["outcome"]["status"] == "completed"
+    assert observed["in_flight"] is False
+    assert observed["error"] == "side effect failed"
