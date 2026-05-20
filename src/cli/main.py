@@ -1,33 +1,86 @@
 """CLI entry point for the agent orchestrator."""
 
 import argparse
+from pathlib import Path
 import sys
 
-from src.common.config import Config
+import yaml
+
 from src.common.logging import configure_logging
 
 
-def cli():
+def load_manifest(manifest_path: str) -> tuple[Path, dict]:
+    path = Path(manifest_path)
+    if not path.exists():
+        raise ValueError(f"manifest does not exist: {manifest_path}")
+    if not path.is_file():
+        raise ValueError(f"manifest is not a file: {manifest_path}")
+
+    try:
+        manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"manifest is invalid YAML: {exc}") from exc
+
+    if manifest is None:
+        raise ValueError("manifest is empty")
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a YAML mapping")
+
+    return path, manifest
+
+
+def deploy_manifest(manifest_path: Path, manifest: dict) -> None:
+    print(f"Deploying agent from manifest: {manifest_path}")
+
+
+def cli(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output",
+    )
 
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        help="Available commands",
+    )
 
-    init_parser = subparsers.add_parser("init", help="Initialize a new project")
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Initialize a new project",
+    )
     init_parser.add_argument("name", help="Project name")
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
+    deploy_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the manifest without deploying an agent",
+    )
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
-    status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
+    status_parser.add_argument(
+        "--watch",
+        "-w",
+        action="store_true",
+        help="Watch mode",
+    )
 
     logs_parser = subparsers.add_parser("logs", help="View agent logs")
     logs_parser.add_argument("agent_id", help="Agent ID")
-    logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+    logs_parser.add_argument(
+        "--tail",
+        "-t",
+        type=int,
+        default=50,
+        help="Number of lines",
+    )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.verbose:
         configure_logging("DEBUG")
@@ -37,18 +90,32 @@ def cli():
     if args.command == "init":
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
-        print(f"Deploying agent from manifest: {args.manifest}")
+        try:
+            manifest_path, manifest = load_manifest(args.manifest)
+        except ValueError as exc:
+            print(f"Deploy validation failed: {exc}", file=sys.stderr)
+            return 2
+
+        if args.dry_run:
+            print(
+                "Dry run passed: manifest is valid; "
+                f"no deploy performed: {manifest_path}"
+            )
+        else:
+            deploy_manifest(manifest_path, manifest)
     elif args.command == "status":
         print("Checking agent status...")
     elif args.command == "logs":
         print(f"Fetching logs for agent: {args.agent_id}")
     else:
         parser.print_help()
-        sys.exit(1)
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    cli()
+    sys.exit(cli())
 
 # 2019-01-03T18:44:00 update
 
