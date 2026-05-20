@@ -117,15 +117,20 @@ class WebhookDeliveryLogs:
         event_id: str,
         payload: Dict[str, Any],
         callback: Optional[Dict[str, Any]] = None,
+        endpoint_version: Optional[int] = None,
     ) -> DeliveryRecord:
         endpoint = self._scoped_endpoint(workspace_id, endpoint_id)
-        if not endpoint.enabled:
+        rejection_reason = self._endpoint_rejection_reason(
+            endpoint,
+            endpoint_version,
+        )
+        if rejection_reason:
             return self.record_failure(
                 workspace_id,
                 endpoint_id,
                 event_id,
                 payload,
-                {"reason": "endpoint_disabled"},
+                {"reason": rejection_reason},
                 callback=callback,
                 status="rejected",
             )
@@ -149,11 +154,16 @@ class WebhookDeliveryLogs:
         failure: Dict[str, Any],
         callback: Optional[Dict[str, Any]] = None,
         status: str = "failed",
+        endpoint_version: Optional[int] = None,
     ) -> DeliveryRecord:
         endpoint = self._scoped_endpoint(workspace_id, endpoint_id)
-        if status != "rejected" and not endpoint.enabled:
+        rejection_reason = self._endpoint_rejection_reason(
+            endpoint,
+            endpoint_version,
+        )
+        if status != "rejected" and rejection_reason:
             status = "rejected"
-            failure = {**failure, "reason": "endpoint_disabled"}
+            failure = {**failure, "reason": rejection_reason}
         return self._persist_once(
             workspace_id=workspace_id,
             endpoint_id=endpoint_id,
@@ -172,6 +182,7 @@ class WebhookDeliveryLogs:
         event_id: str,
         payload: Dict[str, Any],
         failure: Dict[str, Any],
+        endpoint_version: Optional[int] = None,
     ) -> DeliveryRecord:
         endpoint = self._scoped_endpoint(workspace_id, endpoint_id)
         existing_retry = self._matching_records(
@@ -182,13 +193,17 @@ class WebhookDeliveryLogs:
         )
         if existing_retry:
             return existing_retry[-1]
-        if not endpoint.enabled:
+        rejection_reason = self._endpoint_rejection_reason(
+            endpoint,
+            endpoint_version,
+        )
+        if rejection_reason:
             return self.record_failure(
                 workspace_id,
                 endpoint_id,
                 event_id,
                 payload,
-                {**failure, "reason": "endpoint_disabled"},
+                {**failure, "reason": rejection_reason},
                 status="rejected",
             )
         attempt = (
@@ -271,6 +286,20 @@ class WebhookDeliveryLogs:
             raise ValueError("webhook endpoint is not available")
         return endpoint
 
+    @staticmethod
+    def _endpoint_rejection_reason(
+        endpoint: WebhookEndpoint,
+        endpoint_version: Optional[int],
+    ) -> Optional[str]:
+        if not endpoint.enabled:
+            return "endpoint_disabled"
+        if (
+            endpoint_version is not None
+            and endpoint.version != endpoint_version
+        ):
+            return "endpoint_rotated"
+        return None
+
 
 def redact_webhook_payload(value: Any) -> Any:
     if isinstance(value, dict):
@@ -310,4 +339,14 @@ def _is_sensitive(key: str) -> bool:
 
 
 def _is_internal_only(key: str) -> bool:
-    return key.lower().replace("-", "_") in INTERNAL_ONLY_FIELDS
+    normalized = key.lower().replace("-", "_")
+    return (
+        normalized in INTERNAL_ONLY_FIELDS
+        or (
+            not _is_sensitive(key)
+            and (
+                normalized.startswith("internal_")
+                or normalized.startswith("private_")
+            )
+        )
+    )

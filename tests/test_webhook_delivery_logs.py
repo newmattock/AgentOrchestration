@@ -120,6 +120,35 @@ def test_retry_records_are_idempotent_and_redacted():
     assert len(logs.workspace_records("workspace-a")) == 1
 
 
+def test_rotated_endpoint_rejects_stale_version_delivery_logs():
+    logs = WebhookDeliveryLogs()
+    endpoint = logs.register_endpoint(
+        "endpoint-a",
+        "workspace-a",
+        "https://example.com/webhook",
+        "signing-secret",
+    )
+    assert logs.rotate_endpoint_secret("endpoint-a", "rotated-secret")
+
+    record = logs.record_success(
+        "workspace-a",
+        "endpoint-a",
+        "event-rotated",
+        {
+            "event": "agent.failed",
+            "signature": "Bearer live-secret",
+            "private_debug": "internal-trace-1",
+        },
+        endpoint_version=endpoint.version,
+    )
+
+    assert record.status == "rejected"
+    assert record.failure["reason"] == "endpoint_rotated"
+    assert record.payload["signature"] == REDACTED
+    assert "private_debug" not in record.payload
+    assert not contains_private_fields(record.payload, PRIVATE_VALUES)
+
+
 def test_workspace_isolation_blocks_cross_workspace_delivery_logs():
     logs = WebhookDeliveryLogs()
     logs.register_endpoint(
@@ -160,3 +189,30 @@ def test_redaction_recurses_through_lists_and_removes_internal_fields():
         ],
     }
     assert not contains_private_fields(redacted, PRIVATE_VALUES)
+
+
+def test_api_webhook_module_uses_same_redaction_contract():
+    from src.api.webhooks import (
+        WebhookDeliveryService,
+        sanitize_delivery_fields,
+    )
+
+    logs = WebhookDeliveryService()
+    logs.register_endpoint(
+        "endpoint-a",
+        "workspace-a",
+        "https://example.com/webhook",
+        "signing-secret",
+    )
+
+    record = logs.record_failure(
+        "workspace-a",
+        "endpoint-a",
+        "event-1",
+        {"private_debug": "internal-trace-1", "token": "retry-token-1"},
+        {"reason": "timeout"},
+    )
+
+    assert "private_debug" not in record.payload
+    assert record.payload["token"] == REDACTED
+    assert sanitize_delivery_fields({"internal_headers": {"x": "y"}}) == {}
