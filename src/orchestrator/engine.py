@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from src.agent import AgentRegistry, AgentStatus
 from src.orchestrator.scheduler import TaskScheduler
@@ -61,14 +61,22 @@ class OrchestrationEngine:
                 timeout=self.agent_timeout,
             )
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
+            if not self.scheduler.complete(task_id, result=result):
+                raise RuntimeError(
+                    f"Task {task_id} completion could not be persisted"
+                )
 
             for hook in self._hooks["post_execute"]:
+                await hook(task, result)
+
+            for hook in self._hooks["on_complete"]:
                 await hook(task, result)
 
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            self.scheduler.fail(task_id, error=e)
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
 
@@ -82,7 +90,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 

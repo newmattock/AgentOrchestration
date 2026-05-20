@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -29,12 +28,46 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
+        outcome = self.scheduler.terminal_outcome(task["id"])
+        assert outcome["status"] == "completed"
+        assert outcome["task_id"] == task["id"]
+        assert not self.scheduler.is_in_flight(task["id"])
+
+    def test_completion_records_only_one_terminal_outcome(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.complete(task["id"], result={"value": "first"})
+        assert self.scheduler.complete(task["id"], result={"value": "second"})
+
+        outcome = self.scheduler.terminal_outcome(task["id"])
+        assert outcome["result"] == {"value": "first"}
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+        retried = asyncio.run(self.scheduler.dequeue())
+        assert retried["id"] == task["id"]
+        assert retried["retries"] == 1
+
+    def test_failed_task_records_terminal_outcome_after_retry_budget(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        task = asyncio.run(self.scheduler.dequeue())
+        assert self.scheduler.fail(task["id"])
+        task = asyncio.run(self.scheduler.dequeue())
+        assert not self.scheduler.fail(task["id"], error=RuntimeError("boom"))
+
+        outcome = self.scheduler.terminal_outcome(task["id"])
+        assert outcome["status"] == "failed"
+        assert outcome["retries"] == 3
+        assert outcome["error"] == "boom"
 
 # 2019-01-09T19:07:03 update
 
