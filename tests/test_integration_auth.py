@@ -75,6 +75,32 @@ def test_webhook_management_rejects_anonymous_principal():
 
 
 @pytest.mark.parametrize(
+    ("headers", "expected_detail"),
+    [
+        ({"Authorization": "Basic token-a"}, "Malformed authorization header"),
+        ({"Authorization": "Bearer "}, "Malformed authorization header"),
+        (
+            {"Authorization": "Bearer unknown"},
+            "Invalid integration credential",
+        ),
+    ],
+)
+def test_webhook_management_rejects_malformed_token_principals(
+    headers,
+    expected_detail,
+):
+    service = IntegrationAuthService(allow_legacy_bearer=False)
+    service.register_token("token-a", credential())
+    client = build_client(service)
+
+    response = post_webhook(client, headers=headers)
+
+    assert response.status_code == 401
+    assert expected_detail in response.text
+    assert webhook_registry == {}
+
+
+@pytest.mark.parametrize(
     "record",
     [
         credential(scopes=frozenset({"agents:read"})),
