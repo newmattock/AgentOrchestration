@@ -1,22 +1,31 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.orchestrator.scheduler import TaskScheduler
 
 router = APIRouter()
 registry = AgentRegistry()
+scheduler = TaskScheduler()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +62,22 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.get("/dead-letters")
+async def list_dead_letters():
+    return {"dead_letters": scheduler.list_dead_letters()}
+
+
+@router.get("/dead-letters/{task_id}/raw")
+async def get_raw_dead_letter(task_id: str, actor: str, reason: str):
+    try:
+        record = scheduler.get_dead_letter_raw(task_id, actor, reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if record is None:
+        raise HTTPException(status_code=404, detail="Dead-letter not found")
+    return record
 
 # 2019-03-18T11:10:18 update
 

@@ -36,6 +36,82 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_dead_letter_view_redacts_payload_by_default(self):
+        self.scheduler._max_retries = 1
+        task_id = self.scheduler.enqueue({
+            "type": "email",
+            "payload": {
+                "recipient": "customer@example.com",
+                "token": "secret-token",
+                "metadata": {
+                    "account_id": "acct-123",
+                    "api_key": "live-key",
+                },
+                "events": [
+                    {"password": "p@ssw0rd", "status": "failed"},
+                ],
+            },
+        })
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(task["id"])
+
+        [summary] = self.scheduler.list_dead_letters()
+        assert summary["id"] == task_id
+        assert "payload" not in summary
+        assert summary["payload_summary"]["recipient"] == {"type": "str"}
+        assert summary["payload_summary"]["token"] == "[redacted]"
+        assert summary["payload_summary"]["metadata"]["account_id"] == {
+            "type": "str"
+        }
+        metadata = summary["payload_summary"]["metadata"]
+        first_event = summary["payload_summary"]["events"]["items"][0]
+        assert metadata["api_key"] == "[redacted]"
+        assert first_event["password"] == "[redacted]"
+        assert "secret-token" not in repr(summary)
+        assert "customer@example.com" not in repr(summary)
+        assert "live-key" not in repr(summary)
+
+    def test_raw_dead_letter_access_requires_actor_and_reason(self):
+        self.scheduler._max_retries = 1
+        task_id = self.scheduler.enqueue({
+            "type": "email",
+            "payload": {"token": "secret-token"},
+        })
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert not self.scheduler.fail(task["id"])
+
+        with pytest.raises(ValueError, match="actor is required"):
+            self.scheduler.get_dead_letter_raw(task_id, "", "debug incident")
+        with pytest.raises(ValueError, match="reason is required"):
+            self.scheduler.get_dead_letter_raw(task_id, "operator-1", "")
+
+    def test_raw_dead_letter_access_is_audited_without_payload(self):
+        self.scheduler._max_retries = 1
+        task_id = self.scheduler.enqueue({
+            "type": "email",
+            "payload": {"token": "secret-token"},
+        })
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert not self.scheduler.fail(task["id"])
+
+        raw = self.scheduler.get_dead_letter_raw(
+            task_id,
+            actor="operator-1",
+            reason="debug failed delivery",
+        )
+
+        assert raw["payload"]["token"] == "secret-token"
+        [audit_record] = self.scheduler.raw_access_audit()
+        assert audit_record["task_id"] == task_id
+        assert audit_record["actor"] == "operator-1"
+        assert audit_record["reason"] == "debug failed delivery"
+        assert "payload" not in audit_record
+        assert "secret-token" not in repr(audit_record)
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update

@@ -1,10 +1,23 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
+import copy
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+
+SENSITIVE_PAYLOAD_KEYS = {
+    "access_token",
+    "api_key",
+    "authorization",
+    "cookie",
+    "password",
+    "private_key",
+    "secret",
+    "session",
+    "token",
+}
 
 
 class PriorityQueue:
@@ -35,9 +48,16 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._dead_letters: Dict[str, Dict[str, Any]] = {}
+        self._raw_access_audit: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,13 +68,23 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -79,7 +109,90 @@ class TaskScheduler:
             if task["retries"] < self._max_retries:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
+            self._write_dead_letter(task, queue, "max_retries_exceeded")
         return False
+
+    def _write_dead_letter(self, task: Dict, queue: str, reason: str) -> None:
+        task_id = task["id"]
+        if task_id in self._dead_letters:
+            return
+
+        self._dead_letters[task_id] = {
+            "id": task_id,
+            "type": task.get("type"),
+            "queue": queue,
+            "retries": task.get("retries", 0),
+            "reason": reason,
+            "failed_at": time.time(),
+            "payload": copy.deepcopy(task.get("payload")),
+        }
+
+    def list_dead_letters(self) -> List[Dict[str, Any]]:
+        return [
+            self._redacted_dead_letter(record)
+            for record in self._dead_letters.values()
+        ]
+
+    def get_dead_letter_raw(
+        self, task_id: str, actor: str, reason: str
+    ) -> Optional[Dict[str, Any]]:
+        if not actor or not actor.strip():
+            raise ValueError("actor is required for raw dead-letter access")
+        if not reason or not reason.strip():
+            raise ValueError("reason is required for raw dead-letter access")
+
+        record = self._dead_letters.get(task_id)
+        if record is None:
+            return None
+
+        self._raw_access_audit.append(
+            {
+                "task_id": task_id,
+                "actor": actor.strip(),
+                "reason": reason.strip(),
+                "accessed_at": time.time(),
+            }
+        )
+        return copy.deepcopy(record)
+
+    def raw_access_audit(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._raw_access_audit]
+
+    def _redacted_dead_letter(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": record["id"],
+            "type": record.get("type"),
+            "queue": record.get("queue"),
+            "retries": record.get("retries"),
+            "reason": record.get("reason"),
+            "failed_at": record.get("failed_at"),
+            "payload_summary": self._summarize_payload(record.get("payload")),
+        }
+
+    def _summarize_payload(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: "[redacted]"
+                if self._is_sensitive_payload_key(key)
+                else self._summarize_payload(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return {
+                "type": "list",
+                "length": len(value),
+                "items": [
+                    self._summarize_payload(item)
+                    for item in value[:3]
+                ],
+            }
+        if value is None:
+            return {"type": "none"}
+        return {"type": type(value).__name__}
+
+    def _is_sensitive_payload_key(self, key: str) -> bool:
+        lowered = key.lower()
+        return any(token in lowered for token in SENSITIVE_PAYLOAD_KEYS)
 
 # 2019-04-25T08:37:12 update
 
