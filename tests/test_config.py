@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,38 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_runtime_ao_variables_do_not_enter_config_tree(self, monkeypatch):
+        monkeypatch.setenv("AO_AGENT_ID", "runtime-agent")
+        monkeypatch.setenv("AO_API_KEY", "secret-key")
+
+        config = Config()
+
+        assert config.get("agent.id") is None
+        assert config.get("api.key") is None
+        assert config.to_dict() == {}
+
+    def test_scoped_config_env_override_is_imported(self, monkeypatch):
+        monkeypatch.setenv("AO_CONFIG_APP_NAME", "from-env")
+        monkeypatch.setenv("AO_CONFIG_DATABASE_HOST", "db.internal")
+
+        config = Config()
+
+        assert config.get("app.name") == "from-env"
+        assert config.get("database.host") == "db.internal"
+
+    def test_scoped_config_env_override_replaces_file_value(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"app": {"name": "from-file"}}')
+        monkeypatch.setenv("AO_CONFIG_APP_NAME", "from-env")
+
+        config = Config(str(config_file))
+
+        assert config.get("app.name") == "from-env"
 
 # 2019-02-01T18:58:35 update
 
