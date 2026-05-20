@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,31 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_env_override_parses_false_boolean_value(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_ENABLED", "false")
+
+        config = Config()
+
+        assert config.get("feature.enabled") is False
+
+    def test_env_override_parses_case_insensitive_booleans(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_VISIBLE", " TRUE ")
+        monkeypatch.setenv("AO_FEATURE_DISABLED", " FALSE ")
+
+        config = Config()
+
+        assert config.get("feature.visible") is True
+        assert config.get("feature.disabled") is False
+
+    def test_env_override_preserves_non_boolean_strings(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_MODE", "0")
+        monkeypatch.setenv("AO_FEATURE_NAME", "falsehood")
+
+        config = Config()
+
+        assert config.get("feature.mode") == "0"
+        assert config.get("feature.name") == "falsehood"
 
 # 2019-02-01T18:58:35 update
 
