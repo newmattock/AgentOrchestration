@@ -25,6 +25,7 @@ class CredentialRecord:
     scopes: frozenset[str] = field(default_factory=frozenset)
     disabled: bool = False
     revoked: bool = False
+    stale: bool = False
     expires_at: datetime | None = None
 
     def is_expired(self, now: datetime | None = None) -> bool:
@@ -83,7 +84,7 @@ class IntegrationAuthService:
 
         if record is None:
             raise IntegrationAuthError(401, "Invalid integration credential")
-        self._validate_record(record)
+        self._validate_record(credential_type, credential, record)
         principal = AuthPrincipal(
             principal_id=record.principal_id,
             credential_type=credential_type,
@@ -141,13 +142,31 @@ class IntegrationAuthService:
 
         raise IntegrationAuthError(401, "Missing integration credential")
 
-    def _validate_record(self, record: CredentialRecord) -> None:
+    def _validate_record(
+        self,
+        credential_type: str,
+        credential: str,
+        record: CredentialRecord,
+    ) -> None:
+        if record.stale:
+            self._invalidate_credential(credential_type, credential)
+            raise IntegrationAuthError(401, "Credential is stale")
         if record.disabled:
             raise IntegrationAuthError(401, "Principal is disabled")
         if record.revoked:
             raise IntegrationAuthError(401, "Credential has been revoked")
         if record.is_expired():
             raise IntegrationAuthError(401, "Credential has expired")
+
+    def _invalidate_credential(
+        self,
+        credential_type: str,
+        credential: str,
+    ) -> None:
+        if credential_type == "bearer":
+            self._bearer_tokens.pop(credential, None)
+        else:
+            self._session_ids.pop(credential, None)
 
 
 def get_integration_auth_service(request: Request) -> IntegrationAuthService:

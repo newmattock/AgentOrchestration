@@ -75,6 +75,40 @@ def test_webhook_management_rejects_anonymous_principal():
 
 
 @pytest.mark.parametrize(
+    ("credential_type", "request_kwargs"),
+    [
+        (
+            "bearer",
+            {"headers": {"Authorization": "Bearer stale-token"}},
+        ),
+        (
+            "session",
+            {"headers": {"x-integration-session": "stale-session"}},
+        ),
+    ],
+)
+def test_webhook_management_invalidates_stale_credentials(
+    credential_type,
+    request_kwargs,
+):
+    service = IntegrationAuthService(allow_legacy_bearer=False)
+    client = build_client(service)
+    if credential_type == "bearer":
+        service.register_token("stale-token", credential(stale=True))
+    else:
+        service.register_session("stale-session", credential(stale=True))
+
+    first_response = post_webhook(client, **request_kwargs)
+    second_response = post_webhook(client, **request_kwargs)
+
+    assert first_response.status_code == 401
+    assert "Credential is stale" in first_response.text
+    assert second_response.status_code == 401
+    assert "Invalid integration credential" in second_response.text
+    assert webhook_registry == {}
+
+
+@pytest.mark.parametrize(
     ("headers", "expected_detail"),
     [
         ({"Authorization": "Basic token-a"}, "Malformed authorization header"),
