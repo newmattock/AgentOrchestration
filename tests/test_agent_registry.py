@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -39,6 +38,59 @@ class TestAgentRegistry:
         assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
         agent = self.registry.get(agent_id)
         assert agent["status"] == "running"
+
+    def test_permission_change_invalidates_cached_authorization(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {
+                "permissions": ["tasks.run"],
+                "runtime_secret": "do-not-log",
+            },
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry.resolve_authorized(agent_id, "tasks.run")
+
+        assert self.registry.update_permissions(agent_id, [])
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == "running"
+        assert self.registry.resolve_authorized(agent_id, "tasks.run") is None
+        assert agent["metrics"]["authorization_cache_invalidations"] == 1
+        assert agent["metrics"]["authorization_denials"] == 1
+
+        audit_log = self.registry.authorization_audit_log()
+        assert {
+            "agent_id": agent_id,
+            "event": "authorization_cache_invalidated",
+            "reason": "permission_changed",
+            "entries": 1,
+        } in audit_log
+        assert any(
+            entry["event"] == "authorization_resolution"
+            and entry["reason"] == "permission_denied"
+            and entry["allowed"] is False
+            for entry in audit_log
+        )
+        assert "do-not-log" not in repr(audit_log)
+
+    def test_status_change_invalidates_cached_authorization(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"permissions": ["tasks.run"]},
+        )
+        assert self.registry.resolve_authorized(agent_id, "tasks.run")
+
+        assert self.registry.update_status(agent_id, AgentStatus.TERMINATED)
+
+        assert self.registry.resolve_authorized(agent_id, "tasks.run") is None
+        agent = self.registry.get(agent_id)
+        assert agent["metrics"]["authorization_cache_invalidations"] == 1
+        assert any(
+            entry["reason"] == "inactive_lifecycle_state"
+            for entry in self.registry.authorization_audit_log()
+        )
 
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")

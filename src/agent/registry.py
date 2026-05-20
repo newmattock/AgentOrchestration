@@ -1,10 +1,9 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 class AgentStatus(Enum):
@@ -21,20 +20,39 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._resolution_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._authorization_audit: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
+        agent_config = dict(config or {})
+        permissions = self._normalize_permissions(
+            agent_config.get("permissions", [])
+        )
+        agent_config["permissions"] = sorted(permissions)
         self._agents[agent_id] = {
             "id": agent_id,
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": agent_config,
             "created_at": timestamp,
             "updated_at": timestamp,
+            "authorization_version": 1,
             "version": "1.0.0",
-            "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
+            "metrics": {
+                "tasks_completed": 0,
+                "errors": 0,
+                "uptime": 0,
+                "authorization_cache_invalidations": 0,
+                "authorization_denials": 0,
+            },
         }
         group = agent_type.split(".")[0]
         if group not in self._index:
@@ -45,7 +63,11 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -57,9 +79,97 @@ class AgentRegistry:
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
         if agent_id not in self._agents:
             return False
+        previous_status = self._agents[agent_id]["status"]
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        if previous_status != status.value:
+            self._invalidate_resolution_cache(agent_id, "status_changed")
         return True
+
+    def update_permissions(
+        self,
+        agent_id: str,
+        permissions: List[str],
+    ) -> bool:
+        if agent_id not in self._agents:
+            return False
+        agent = self._agents[agent_id]
+        agent["config"]["permissions"] = sorted(
+            self._normalize_permissions(permissions)
+        )
+        agent["authorization_version"] += 1
+        agent["updated_at"] = time.time()
+        self._invalidate_resolution_cache(agent_id, "permission_changed")
+        return True
+
+    def resolve_authorized(
+        self,
+        agent_id: str,
+        permission: str,
+    ) -> Optional[Dict[str, Any]]:
+        agent = self._agents.get(agent_id)
+        permission_name = str(permission)
+        if not agent:
+            self._record_authorization_decision(
+                agent_id,
+                permission_name,
+                "agent_not_found",
+                allowed=False,
+            )
+            return None
+
+        cache_key = (agent_id, permission_name)
+        cached = self._resolution_cache.get(cache_key)
+        if cached and self._cache_entry_is_current(agent, cached):
+            self._record_authorization_decision(
+                agent_id,
+                permission_name,
+                "cache_hit",
+                allowed=True,
+            )
+            return agent
+        if cached:
+            self._invalidate_resolution_cache(agent_id, "stale_resolution")
+
+        if agent["status"] in {
+            AgentStatus.FAILED.value,
+            AgentStatus.TERMINATED.value,
+        }:
+            self._record_authorization_decision(
+                agent_id,
+                permission_name,
+                "inactive_lifecycle_state",
+                allowed=False,
+            )
+            return None
+
+        permissions = self._normalize_permissions(
+            agent["config"].get("permissions", [])
+        )
+        if permission_name not in permissions:
+            agent["metrics"]["authorization_denials"] += 1
+            self._record_authorization_decision(
+                agent_id,
+                permission_name,
+                "permission_denied",
+                allowed=False,
+            )
+            return None
+
+        self._resolution_cache[cache_key] = {
+            "authorization_version": agent["authorization_version"],
+            "status": agent["status"],
+        }
+        self._record_authorization_decision(
+            agent_id,
+            permission_name,
+            "authorized",
+            allowed=True,
+        )
+        return agent
+
+    def authorization_audit_log(self) -> List[Dict[str, Any]]:
+        return list(self._authorization_audit)
 
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
@@ -68,10 +178,70 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._invalidate_resolution_cache(agent_id, "agent_deleted")
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def _normalize_permissions(self, permissions: Any) -> Set[str]:
+        if permissions is None:
+            return set()
+        if isinstance(permissions, str):
+            return {permissions}
+        return {str(permission) for permission in permissions}
+
+    def _cache_entry_is_current(
+        self,
+        agent: Dict[str, Any],
+        cached: Dict[str, Any],
+    ) -> bool:
+        return (
+            cached["authorization_version"]
+            == agent["authorization_version"]
+            and cached["status"] == agent["status"]
+        )
+
+    def _invalidate_resolution_cache(
+        self,
+        agent_id: str,
+        reason: str,
+    ) -> None:
+        keys = [
+            key for key in self._resolution_cache if key[0] == agent_id
+        ]
+        if not keys:
+            return
+        for key in keys:
+            self._resolution_cache.pop(key, None)
+        agent = self._agents.get(agent_id)
+        if agent:
+            agent["metrics"]["authorization_cache_invalidations"] += len(keys)
+        self._authorization_audit.append(
+            {
+                "agent_id": agent_id,
+                "event": "authorization_cache_invalidated",
+                "reason": reason,
+                "entries": len(keys),
+            }
+        )
+
+    def _record_authorization_decision(
+        self,
+        agent_id: str,
+        permission: str,
+        reason: str,
+        allowed: bool,
+    ) -> None:
+        self._authorization_audit.append(
+            {
+                "agent_id": agent_id,
+                "permission": permission,
+                "event": "authorization_resolution",
+                "reason": reason,
+                "allowed": allowed,
+            }
+        )
 
 # 2019-01-29T11:24:49 update
 
