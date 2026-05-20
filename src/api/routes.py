@@ -1,22 +1,91 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+import uuid
+from typing import Any, Dict, Optional
 
-from src.agent import AgentRegistry, AgentStatus
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+
+from src.agent import AgentRegistry
+from src.agent.registry import AgentStatus
+from src.api.auth import Principal, require_template_clone_principal
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
+class TemplateCloneRequest(BaseModel):
+    name: str = Field(min_length=1)
+
+
+class AgentTemplateStore:
+    def __init__(self):
+        self._templates: Dict[str, Dict[str, Any]] = {}
+        self._clones: Dict[str, Dict[str, Any]] = {}
+        self.clone_attempts = 0
+
+    def reset(self) -> None:
+        self._templates.clear()
+        self._clones.clear()
+        self.clone_attempts = 0
+
+    def add_template(
+        self,
+        template_id: str,
+        workspace_id: str,
+        name: str,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._templates[template_id] = {
+            "id": template_id,
+            "workspace_id": workspace_id,
+            "name": name,
+            "config": config or {},
+        }
+
+    def clone(
+        self,
+        template_id: str,
+        workspace_id: str,
+        clone_name: str,
+        principal: Principal,
+    ) -> Dict[str, Any]:
+        self.clone_attempts += 1
+        template = self._templates.get(template_id)
+        if not template or template["workspace_id"] != workspace_id:
+            raise KeyError(template_id)
+
+        clone_id = str(uuid.uuid4())
+        clone = {
+            "id": clone_id,
+            "source_template_id": template_id,
+            "workspace_id": workspace_id,
+            "name": clone_name,
+            "created_by": principal.subject,
+            "config": template["config"].copy(),
+        }
+        self._clones[clone_id] = clone
+        return clone
+
+
+template_store = AgentTemplateStore()
+
+
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +122,28 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post(
+    "/workspaces/{workspace_id}/agent-templates/{template_id}/clone",
+    status_code=201,
+)
+async def clone_agent_template(
+    workspace_id: str,
+    template_id: str,
+    payload: TemplateCloneRequest,
+    principal: Principal = Depends(require_template_clone_principal),
+):
+    try:
+        clone = template_store.clone(
+            template_id=template_id,
+            workspace_id=workspace_id,
+            clone_name=payload.name,
+            principal=principal,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"template": clone}
 
 # 2019-03-18T11:10:18 update
 
