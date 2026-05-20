@@ -43,6 +43,7 @@ class TestTaskScheduler:
                 "type": "dispatch",
                 "payload": {"secret": "not-for-audit"},
                 "workflow": {
+                    "id": "workflow-1",
                     "dispatch_policy": {
                         "blackout_windows": [{"start": 90, "end": 120}],
                     },
@@ -61,10 +62,37 @@ class TestTaskScheduler:
                 "queue": "default",
                 "window_start": 90.0,
                 "window_end": 120.0,
+                "workflow_id": "workflow-1",
+                "deferred_until": 120.0,
                 "reason": "workflow_blackout_window",
             }
         ]
+        assert scheduler._scheduled[task_id]["ready_at"] == 120.0
+        assert asyncio.run(scheduler.dequeue()) is None
+        assert scheduler.dispatch_metrics["blackout_deferrals"] == 1
         assert "secret" not in str(scheduler.audit_records)
+
+    def test_blackout_task_does_not_block_other_ready_work(self):
+        current_time = {"value": 100.0}
+        scheduler = TaskScheduler(time_fn=lambda: current_time["value"])
+        blocked_id = scheduler.enqueue(
+            {
+                "type": "blocked",
+                "workflow_id": "workflow-2",
+                "workflow": {"blackout_windows": [{"start": 90, "end": 120}]},
+            },
+            priority=10,
+        )
+        ready_id = scheduler.enqueue({"type": "ready"}, priority=1)
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == ready_id
+        assert task["type"] == "ready"
+        assert scheduler._scheduled[blocked_id]["ready_at"] == 120.0
+        assert scheduler.dispatch_metrics["blackout_deferrals"] == 1
 
     def test_dequeue_dispatches_after_blackout_window(self):
         current_time = {"value": 100.0}
@@ -78,6 +106,7 @@ class TestTaskScheduler:
 
         import asyncio
         assert asyncio.run(scheduler.dequeue()) is None
+        assert scheduler._scheduled[task_id]["ready_at"] == 120.0
         current_time["value"] = 121.0
         task = asyncio.run(scheduler.dequeue())
 
@@ -91,6 +120,7 @@ class TestTaskScheduler:
         task_id = scheduler.schedule(
             {
                 "type": "scheduled-dispatch",
+                "workflow_id": "workflow-3",
                 "dispatch_policy": {"blackout_windows": [(90, 120)]},
             },
             delay=0,
@@ -99,6 +129,7 @@ class TestTaskScheduler:
         import asyncio
         assert asyncio.run(scheduler.dequeue()) is None
         assert scheduler.dispatch_metrics["blackout_deferrals"] == 1
+        assert scheduler._scheduled[task_id]["ready_at"] == 120.0
         current_time["value"] = 120.0
         task = asyncio.run(scheduler.dequeue())
 

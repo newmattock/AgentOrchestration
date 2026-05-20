@@ -90,32 +90,22 @@ class TaskScheduler:
         self._promote_ready_scheduled(queue, now)
 
         if queue in self._queues and len(self._queues[queue]) > 0:
-            deferred: List[Dict] = []
             while len(self._queues[queue]) > 0:
                 task = self._queues[queue].pop()
                 if not task:
                     continue
                 blackout = self._active_blackout(task, now)
                 if blackout:
-                    self._record_blackout(task, queue, blackout)
-                    deferred.append(task)
+                    self._defer_blackout_task(
+                        task,
+                        queue,
+                        task.get("priority", 0),
+                        blackout,
+                    )
                     continue
 
-                for deferred_task in deferred:
-                    self._queue_task(
-                        deferred_task,
-                        queue,
-                        deferred_task.get("priority", 0),
-                    )
                 self._in_flight[task["id"]] = task
                 return task
-
-            for deferred_task in deferred:
-                self._queue_task(
-                    deferred_task,
-                    queue,
-                    deferred_task.get("priority", 0),
-                )
         return None
 
     def _promote_ready_scheduled(self, queue: str, now: float) -> None:
@@ -190,9 +180,32 @@ class TaskScheduler:
                 "queue": queue,
                 "window_start": blackout[0],
                 "window_end": blackout[1],
+                "workflow_id": self._workflow_id(task),
+                "deferred_until": blackout[1],
                 "reason": "workflow_blackout_window",
             }
         )
+
+    def _defer_blackout_task(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int,
+        blackout: Tuple[float, float],
+    ) -> None:
+        self._record_blackout(task, queue, blackout)
+        self._scheduled[task["id"]] = {
+            "task": task,
+            "ready_at": blackout[1],
+            "queue": queue,
+            "priority": priority,
+        }
+
+    def _workflow_id(self, task: Dict) -> Optional[str]:
+        workflow = task.get("workflow") or {}
+        if isinstance(workflow, dict):
+            return task.get("workflow_id") or workflow.get("id")
+        return task.get("workflow_id")
 
     @property
     def audit_records(self) -> List[Dict[str, Any]]:
