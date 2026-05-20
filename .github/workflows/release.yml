@@ -1,0 +1,91 @@
+name: Release
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to sign
+        required: true
+
+jobs:
+  build:
+    name: Build release artifacts
+    runs-on: ubuntu-latest
+    outputs:
+      release-tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve release tag
+        id: release
+        run: |
+          tag="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          fi
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+      - name: Build artifact
+        run: |
+          mkdir -p dist
+          printf 'agent-orchestrator %s\n' "${{ steps.release.outputs.tag }}" > dist/agent-orchestrator.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-release-artifacts
+          path: dist/
+
+  sign:
+    name: Sign release artifacts
+    runs-on: ubuntu-latest
+    needs: build
+    concurrency:
+      group: release-signing-${{ needs.build.outputs.release-tag }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: unsigned-release-artifacts
+          path: dist
+      - name: Sign artifacts
+        run: |
+          mkdir -p signed
+          expected=0
+          signed=0
+          for artifact in dist/*; do
+            [ -f "$artifact" ] || continue
+            expected=$((expected + 1))
+            sha256sum "$artifact" > "signed/$(basename "$artifact").sha256"
+            signed=$((signed + 1))
+          done
+          {
+            printf 'expected=%s\n' "$expected"
+            printf 'signed=%s\n' "$signed"
+          } > signed/signing-summary.env
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-signing-summary
+          path: signed/
+
+  release-summary:
+    name: Verify release signing summary
+    runs-on: ubuntu-latest
+    needs: sign
+    if: ${{ always() }}
+    steps:
+      - uses: actions/download-artifact@v4
+        if: ${{ needs.sign.result == 'success' }}
+        with:
+          name: release-signing-summary
+          path: signed
+      - name: Fail on partial signing
+        run: |
+          if [ "${{ needs.sign.result }}" != "success" ]; then
+            echo "Signing job did not complete successfully"
+            exit 1
+          fi
+          . signed/signing-summary.env
+          if [ "$expected" -eq 0 ] || [ "$expected" -ne "$signed" ]; then
+            echo "Partial release signing detected: expected=$expected signed=$signed"
+            exit 1
+          fi
