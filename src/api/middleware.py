@@ -11,12 +11,39 @@ logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
-        return await call_next(request)
+    @staticmethod
+    def _is_cors_preflight(request: Request) -> bool:
+        return (
+            request.method == "OPTIONS"
+            and "origin" in request.headers
+            and "access-control-request-method" in request.headers
+        )
+
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
+        try:
+            if (
+                request.url.path.startswith("/api/v2")
+                and request.url.path != "/api/v2/auth/token"
+            ):
+                request.state.auth_checked = True
+                request.state.authenticated = False
+
+                if self._is_cors_preflight(request):
+                    return await call_next(request)
+
+                token = request.headers.get("Authorization", "")
+                if not token.startswith("Bearer "):
+                    return Response(status_code=401, content="Unauthorized")
+
+                request.state.authenticated = True
+
+            return await call_next(request)
+        finally:
+            for name in ("auth_checked", "authenticated"):
+                if hasattr(request.state, name):
+                    delattr(request.state, name)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +53,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +74,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            f"{request.method} {request.url.path} "
+            f"{response.status_code} {duration:.3f}s"
+        )
         return response
 
 # 2019-03-01T18:35:19 update
