@@ -1,5 +1,6 @@
 import pytest
 from src.common.config import Config, MAX_CONFIG_FILE_BYTES
+from src.common.errors import ConfigurationError
 
 
 class TestConfig:
@@ -14,11 +15,24 @@ class TestConfig:
         config_file = tmp_path / "config.json"
         config_file.write_bytes(b" " * (MAX_CONFIG_FILE_BYTES + 1))
 
-        with pytest.raises(
-            ValueError,
-            match="exceeds the maximum config size",
-        ):
+        with pytest.raises(ConfigurationError, match="maximum config size"):
             Config(str(config_file))
+
+    def test_oversized_config_load_keeps_existing_state(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(Config, "MAX_CONFIG_FILE_BYTES", 32)
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"app": {"name": "' + "x" * 64 + '"}}')
+        config = Config()
+        config.set("app.name", "existing")
+
+        with pytest.raises(ConfigurationError, match="32 bytes"):
+            config.load(str(config_file))
+
+        assert config.get("app.name") == "existing"
 
     def test_default_value(self):
         config = Config()
