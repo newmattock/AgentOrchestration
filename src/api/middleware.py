@@ -1,22 +1,118 @@
 """API middleware components."""
 
+import hashlib
 import time
 import logging
-from typing import Callable
+from contextvars import ContextVar
+from typing import Callable, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+_audit_actor: ContextVar[Optional[str]] = ContextVar(
+    "audit_actor",
+    default=None,
+)
+PROTECTED_API_PREFIX = "/api/v2"
+AUTH_TOKEN_PATH = "/api/v2/auth/token"
+
+
+def get_current_audit_actor() -> Optional[str]:
+    return _audit_actor.get()
+
+
+def _protected_api_request(request: Request) -> bool:
+    return (
+        request.url.path.startswith(PROTECTED_API_PREFIX)
+        and request.url.path != AUTH_TOKEN_PATH
+    )
+
+
+def _actor_from_authorization(authorization: str) -> Optional[str]:
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return None
+    token = authorization[len(prefix):].strip()
+    if not token:
+        return None
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    return f"bearer:{digest}"
+
+
+def _clear_audit_state(request: Request) -> None:
+    for attr in ("authenticated_actor", "audit_actor"):
+        if hasattr(request.state, attr):
+            delattr(request.state, attr)
+
+
+def _audit_rejected_response() -> Response:
+    return Response(
+        status_code=401,
+        content="Unauthorized",
+        headers={"X-Audit-Status": "rejected"},
+    )
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
-        return await call_next(request)
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if _protected_api_request(request):
+            actor = _actor_from_authorization(
+                request.headers.get("Authorization", ""),
+            )
+            if not actor:
+                _clear_audit_state(request)
+                return _audit_rejected_response()
+            request.state.authenticated_actor = actor
+        try:
+            return await call_next(request)
+        finally:
+            if hasattr(request.state, "authenticated_actor"):
+                delattr(request.state, "authenticated_actor")
+
+
+class AuditMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        token = None
+        actor = None
+        try:
+            if _protected_api_request(request):
+                actor = getattr(request.state, "authenticated_actor", None)
+                if not actor:
+                    _clear_audit_state(request)
+                    logger.warning(
+                        "audit rejected unauthenticated request path=%s",
+                        request.url.path,
+                    )
+                    return _audit_rejected_response()
+                request.state.audit_actor = actor
+                token = _audit_actor.set(actor)
+
+            response = await call_next(request)
+            if actor:
+                response.headers["X-Audit-Actor"] = actor
+                response.headers["X-Audit-Status"] = "attached"
+            return response
+        except Exception:
+            logger.exception(
+                "audit middleware exception path=%s actor=%s",
+                request.url.path,
+                actor or "none",
+            )
+            raise
+        finally:
+            if token is not None:
+                _audit_actor.reset(token)
+            _clear_audit_state(request)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +122,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            timestamp
+            for timestamp in self._requests[client_ip]
+            if now - timestamp < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +147,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
