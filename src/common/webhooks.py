@@ -3,6 +3,7 @@
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 REDACTED = "[REDACTED]"
@@ -314,6 +315,8 @@ def redact_webhook_payload(value: Any) -> Any:
         return redacted
     if isinstance(value, list):
         return [redact_webhook_payload(item) for item in value]
+    if isinstance(value, str):
+        return _redact_url_query(value)
     return value
 
 
@@ -348,5 +351,29 @@ def _is_internal_only(key: str) -> bool:
                 normalized.startswith("internal_")
                 or normalized.startswith("private_")
             )
+        )
+    )
+
+
+def _redact_url_query(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.query:
+        return value
+
+    safe_query = []
+    for key, nested in parse_qsl(parsed.query, keep_blank_values=True):
+        if _is_internal_only(key):
+            continue
+        if _is_sensitive(key):
+            safe_query.append((key, REDACTED))
+        else:
+            safe_query.append((key, nested))
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(safe_query),
+            parsed.fragment,
         )
     )

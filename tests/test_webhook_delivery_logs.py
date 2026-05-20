@@ -216,3 +216,43 @@ def test_api_webhook_module_uses_same_redaction_contract():
     assert "private_debug" not in record.payload
     assert record.payload["token"] == REDACTED
     assert sanitize_delivery_fields({"internal_headers": {"x": "y"}}) == {}
+
+
+def test_url_query_secrets_are_redacted_in_logs_and_callbacks():
+    logs = WebhookDeliveryLogs()
+    logs.register_endpoint(
+        "endpoint-a",
+        "workspace-a",
+        "https://example.com/webhook",
+        "signing-secret",
+    )
+
+    record = logs.record_failure(
+        "workspace-a",
+        "endpoint-a",
+        "event-1",
+        {
+            "delivery_url": (
+                "https://hooks.example.test/deliver?"
+                "token=retry-token-1&safe=ok&internal_trace_id=trace-1"
+            ),
+        },
+        {"reason": "timeout"},
+        callback={
+            "retry_url": (
+                "https://hooks.example.test/retry?"
+                "signature=Bearer+live-secret&next=1"
+            ),
+        },
+    )
+
+    assert record.payload["delivery_url"] == (
+        "https://hooks.example.test/deliver?"
+        "token=%5BREDACTED%5D&safe=ok"
+    )
+    assert record.callback["retry_url"] == (
+        "https://hooks.example.test/retry?"
+        "signature=%5BREDACTED%5D&next=1"
+    )
+    assert "retry-token-1" not in record.payload["delivery_url"]
+    assert "Bearer" not in record.callback["retry_url"]
