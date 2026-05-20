@@ -114,3 +114,42 @@ def test_bad_redownload_digest_is_not_cached(tmp_path):
 
     assert not cache._artifact_path("artifact.tar").exists()
     assert not cache._metadata_path("artifact.tar").exists()
+
+
+def test_failed_redownload_cleans_up_partial_temporary_file(tmp_path):
+    cache = ArtifactDownloadCache(tmp_path)
+
+    def fail_after_partial_write(path):
+        path.write_bytes(b"partial temporary artifact")
+        raise OSError("network interrupted")
+
+    with pytest.raises(OSError, match="network interrupted"):
+        cache.get_path(
+            "artifact.tar",
+            sha256(b"expected"),
+            fail_after_partial_write,
+        )
+
+    assert not cache._artifact_path("artifact.tar").exists()
+    assert not cache._metadata_path("artifact.tar").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_malformed_metadata_is_evicted_and_redownloaded(tmp_path):
+    cache = ArtifactDownloadCache(tmp_path)
+    content = b"approved artifact"
+    artifact_path = cache._artifact_path("artifact.tar")
+    metadata_path = cache._metadata_path("artifact.tar")
+    artifact_path.write_bytes(content)
+    metadata_path.write_text("{not-json", encoding="utf-8")
+    downloads = 0
+
+    def download(path):
+        nonlocal downloads
+        downloads += 1
+        path.write_bytes(content)
+
+    repaired_path = cache.get_path("artifact.tar", sha256(content), download)
+
+    assert repaired_path.read_bytes() == content
+    assert downloads == 1

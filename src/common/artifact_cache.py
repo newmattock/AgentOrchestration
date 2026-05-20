@@ -32,9 +32,14 @@ class ArtifactDownloadCache:
         self._evict(artifact_path, metadata_path)
         tmp_path = artifact_path.with_suffix(artifact_path.suffix + ".tmp")
         self._evict(tmp_path, None)
-        download(tmp_path)
 
-        actual_digest = _sha256_file(tmp_path)
+        try:
+            download(tmp_path)
+            actual_digest = _sha256_file(tmp_path)
+        except Exception:
+            self._evict(tmp_path, None)
+            raise
+
         if actual_digest != digest:
             self._evict(tmp_path, None)
             raise ArtifactCacheError(
@@ -43,7 +48,10 @@ class ArtifactDownloadCache:
             )
 
         os.replace(tmp_path, artifact_path)
-        metadata_path.write_text(
+        tmp_metadata_path = metadata_path.with_suffix(
+            metadata_path.suffix + ".tmp"
+        )
+        tmp_metadata_path.write_text(
             json.dumps(
                 {
                     "algorithm": "sha256",
@@ -54,6 +62,7 @@ class ArtifactDownloadCache:
             ),
             encoding="utf-8",
         )
+        os.replace(tmp_metadata_path, metadata_path)
         return artifact_path
 
     def _is_valid_hit(
