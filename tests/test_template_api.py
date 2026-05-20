@@ -28,6 +28,19 @@ class TestTemplateApi:
         assert response.status_code == 401
         assert template_store.clone_attempts == 0
 
+    def test_clone_template_rejects_malformed_token_before_store_mutation(
+        self,
+    ):
+        response = self.client.post(
+            "/api/v2/workspaces/workspace-a/agent-templates/template-1/clone",
+            headers={"Authorization": "Token malformed-secret"},
+            json={"name": "clone"},
+        )
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Malformed bearer token"
+        assert template_store.clone_attempts == 0
+
     def test_clone_template_rejects_stale_token_before_store_mutation(self):
         token_authority.register(
             "stale-token",
@@ -68,6 +81,48 @@ class TestTemplateApi:
 
         assert response.status_code == 401
         assert response.json()["detail"] == "Revoked bearer token"
+        assert template_store.clone_attempts == 0
+
+    def test_clone_template_rejects_disabled_token_before_store_mutation(self):
+        token_authority.register(
+            "disabled-token",
+            Principal(
+                subject="user-1",
+                workspace_id="workspace-a",
+                role="operator",
+                disabled=True,
+            ),
+        )
+
+        response = self.client.post(
+            "/api/v2/workspaces/workspace-a/agent-templates/template-1/clone",
+            headers={"Authorization": "Bearer disabled-token"},
+            json={"name": "clone"},
+        )
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Disabled bearer token"
+        assert template_store.clone_attempts == 0
+
+    def test_clone_template_rejects_missing_scope_before_store_mutation(self):
+        token_authority.register(
+            "no-scope-token",
+            Principal(
+                subject="user-1",
+                workspace_id="workspace-a",
+                role="operator",
+                scopes=frozenset(),
+            ),
+        )
+
+        response = self.client.post(
+            "/api/v2/workspaces/workspace-a/agent-templates/template-1/clone",
+            headers={"Authorization": "Bearer no-scope-token"},
+            json={"name": "clone"},
+        )
+
+        assert response.status_code == 403
+        assert response.json()["detail"] == "Insufficient scope"
         assert template_store.clone_attempts == 0
 
     def test_clone_template_rejects_insufficient_role_before_store_mutation(
@@ -140,3 +195,46 @@ class TestTemplateApi:
             "config": {"model": "safe-default"},
         }
         assert template_store.clone_attempts == 1
+
+    def test_clone_template_allows_browser_session_for_same_workspace(self):
+        token_authority.register_session(
+            "session-1",
+            Principal(
+                subject="user-1",
+                workspace_id="workspace-a",
+                role="operator",
+            ),
+        )
+
+        response = self.client.post(
+            "/api/v2/workspaces/workspace-a/agent-templates/template-1/clone",
+            headers={"X-Session-Id": "session-1"},
+            json={"name": "clone"},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["template"]["created_by"] == "user-1"
+        assert template_store.clone_attempts == 1
+
+    def test_clone_template_audit_records_do_not_include_credentials(self):
+        token_authority.register(
+            "secret-token",
+            Principal(
+                subject="user-1",
+                workspace_id="workspace-a",
+                role="viewer",
+            ),
+        )
+
+        response = self.client.post(
+            "/api/v2/workspaces/workspace-a/agent-templates/template-1/clone",
+            headers={"Authorization": "Bearer secret-token"},
+            json={"name": "clone"},
+        )
+
+        assert response.status_code == 403
+        audit_text = str(token_authority.audit_records())
+        assert "insufficient_role" in audit_text
+        assert "user-1" in audit_text
+        assert "secret-token" not in audit_text
+        assert template_store.clone_attempts == 0
