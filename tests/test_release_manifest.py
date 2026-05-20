@@ -8,6 +8,7 @@ from src.common.release import (
 
 
 REQUIRED_ARCHITECTURES = ("linux/amd64", "linux/arm64")
+RELEASE_SHA = "c27c608c27c608c27c608c27c608c27c608c27c608"
 
 
 def test_multi_arch_manifest_includes_only_validated_digests():
@@ -73,6 +74,46 @@ def test_multi_arch_manifest_accepts_common_passing_status_strings():
         "linux/amd64",
         "linux/arm64",
     ]
+
+
+def test_multi_arch_manifest_records_source_sha_and_image_refs():
+    manifest = create_multi_arch_release_manifest(
+        [
+            ArchitectureImageValidation(
+                architecture="linux/amd64",
+                digest="sha256:" + "a" * 64,
+                tests_passed=True,
+                scan_passed=True,
+                source_sha=RELEASE_SHA,
+            ),
+            ArchitectureImageValidation(
+                architecture="linux/arm64",
+                digest="sha256:" + "b" * 64,
+                tests_passed=True,
+                scan_passed=True,
+                source_sha=RELEASE_SHA,
+            ),
+        ],
+        REQUIRED_ARCHITECTURES,
+        expected_source_sha=RELEASE_SHA,
+        image_repository="ghcr.io/orchestration-agent/agent-orchestrator",
+    )
+
+    assert manifest.image_refs() == (
+        "ghcr.io/orchestration-agent/agent-orchestrator@"
+        + "sha256:"
+        + "a" * 64,
+        "ghcr.io/orchestration-agent/agent-orchestrator@"
+        + "sha256:"
+        + "b" * 64,
+    )
+    first_entry = manifest.as_manifest()["manifests"][0]
+    assert first_entry["source_sha"] == RELEASE_SHA
+    assert first_entry["image_ref"] == (
+        "ghcr.io/orchestration-agent/agent-orchestrator@"
+        + "sha256:"
+        + "a" * 64
+    )
 
 
 def test_missing_architecture_result_fails_manifest_publication():
@@ -156,6 +197,33 @@ def test_malformed_sha256_digest_fails_release(digest):
         )
 
 
+def test_stale_architecture_source_sha_fails_release():
+    with pytest.raises(
+        ManifestValidationError,
+        match="linux/arm64.*instead of release source",
+    ):
+        create_multi_arch_release_manifest(
+            [
+                ArchitectureImageValidation(
+                    architecture="linux/amd64",
+                    digest="sha256:" + "a" * 64,
+                    tests_passed=True,
+                    scan_passed=True,
+                    source_sha=RELEASE_SHA,
+                ),
+                ArchitectureImageValidation(
+                    architecture="linux/arm64",
+                    digest="sha256:" + "b" * 64,
+                    tests_passed=True,
+                    scan_passed=True,
+                    source_sha="stale",
+                ),
+            ],
+            REQUIRED_ARCHITECTURES,
+            expected_source_sha=RELEASE_SHA,
+        )
+
+
 @pytest.mark.parametrize(
     ("tests_passed", "scan_passed", "message"),
     [
@@ -212,4 +280,38 @@ def test_release_summary_lists_each_architecture_digest_and_status():
     assert manifest.release_summary().splitlines() == [
         f"linux/amd64: sha256:{'a' * 64} tests=passed scan=passed",
         f"linux/arm64: sha256:{'b' * 64} tests=passed scan=passed",
+    ]
+
+
+def test_release_summary_includes_source_sha_when_validated():
+    manifest = create_multi_arch_release_manifest(
+        [
+            ArchitectureImageValidation(
+                architecture="linux/amd64",
+                digest="sha256:" + "a" * 64,
+                tests_passed=True,
+                scan_passed=True,
+                source_sha=RELEASE_SHA,
+            ),
+            ArchitectureImageValidation(
+                architecture="linux/arm64",
+                digest="sha256:" + "b" * 64,
+                tests_passed=True,
+                scan_passed=True,
+                source_sha=RELEASE_SHA,
+            ),
+        ],
+        REQUIRED_ARCHITECTURES,
+        expected_source_sha=RELEASE_SHA,
+    )
+
+    assert manifest.release_summary().splitlines() == [
+        (
+            f"linux/amd64: sha256:{'a' * 64} tests=passed scan=passed "
+            f"source={RELEASE_SHA}"
+        ),
+        (
+            f"linux/arm64: sha256:{'b' * 64} tests=passed scan=passed "
+            f"source={RELEASE_SHA}"
+        ),
     ]

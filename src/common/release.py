@@ -19,6 +19,7 @@ class ArchitectureImageValidation:
     digest: str
     tests_passed: Any
     scan_passed: Any
+    source_sha: str = ""
 
 
 @dataclass(frozen=True)
@@ -27,12 +28,30 @@ class ValidatedArchitectureDigest:
     digest: str
     test_status: str = "passed"
     scan_status: str = "passed"
+    source_sha: str = ""
+    image_ref: str = ""
 
     def summary_line(self) -> str:
-        return (
+        summary = (
             f"{self.architecture}: {self.digest} "
             f"tests={self.test_status} scan={self.scan_status}"
         )
+        if self.source_sha:
+            summary += f" source={self.source_sha}"
+        return summary
+
+    def as_manifest_entry(self) -> Dict[str, str]:
+        entry = {
+            "architecture": self.architecture,
+            "digest": self.digest,
+            "tests": self.test_status,
+            "scan": self.scan_status,
+        }
+        if self.source_sha:
+            entry["source_sha"] = self.source_sha
+        if self.image_ref:
+            entry["image_ref"] = self.image_ref
+        return entry
 
 
 @dataclass(frozen=True)
@@ -42,12 +61,7 @@ class MultiArchReleaseManifest:
     def as_manifest(self) -> Dict[str, List[Dict[str, str]]]:
         return {
             "manifests": [
-                {
-                    "architecture": digest.architecture,
-                    "digest": digest.digest,
-                    "tests": digest.test_status,
-                    "scan": digest.scan_status,
-                }
+                digest.as_manifest_entry()
                 for digest in self.digests
             ],
         }
@@ -55,10 +69,18 @@ class MultiArchReleaseManifest:
     def release_summary(self) -> str:
         return "\n".join(digest.summary_line() for digest in self.digests)
 
+    def image_refs(self) -> Tuple[str, ...]:
+        return tuple(
+            digest.image_ref or digest.digest
+            for digest in self.digests
+        )
+
 
 def create_multi_arch_release_manifest(
     validations: Iterable[ArchitectureImageValidation],
     required_architectures: Iterable[str],
+    expected_source_sha: str = "",
+    image_repository: str = "",
 ) -> MultiArchReleaseManifest:
     required_order = tuple(required_architectures)
     if not required_order:
@@ -99,11 +121,16 @@ def create_multi_arch_release_manifest(
     validated_digests = []
     for architecture in required_order:
         validation = validations_by_architecture[architecture]
-        _validate_architecture_result(validation)
+        _validate_architecture_result(validation, expected_source_sha)
         validated_digests.append(
             ValidatedArchitectureDigest(
                 architecture=architecture,
                 digest=validation.digest,
+                source_sha=validation.source_sha.strip(),
+                image_ref=_image_ref(
+                    image_repository,
+                    validation.digest,
+                ),
             )
         )
 
@@ -112,6 +139,7 @@ def create_multi_arch_release_manifest(
 
 def _validate_architecture_result(
     validation: ArchitectureImageValidation,
+    expected_source_sha: str = "",
 ) -> None:
     architecture = validation.architecture.strip()
     if not SHA256_DIGEST_RE.fullmatch(validation.digest):
@@ -126,9 +154,24 @@ def _validate_architecture_result(
         raise ManifestValidationError(
             f"{architecture} is missing a passing scan result"
         )
+    source_sha = validation.source_sha.strip()
+    expected_sha = expected_source_sha.strip()
+    if expected_sha and source_sha != expected_sha:
+        built_from = source_sha or "unknown source sha"
+        raise ManifestValidationError(
+            f"{architecture} digest was built from {built_from} "
+            f"instead of release source {expected_sha}"
+        )
 
 
 def _is_passing_validation(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in PASSING_STATUSES
+
+
+def _image_ref(image_repository: str, digest: str) -> str:
+    image = image_repository.strip()
+    if not image:
+        return ""
+    return f"{image}@{digest}"
