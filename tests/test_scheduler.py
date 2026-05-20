@@ -1,5 +1,5 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.engine import OrchestrationEngine
 
 
 class TestTaskScheduler:
@@ -35,6 +35,50 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_repeated_fail_while_retry_queued_is_idempotent(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        assert self.scheduler.fail(task["id"])
+        assert len(self.scheduler._queues["default"]) == 1
+
+    def test_hot_reload_defers_stale_capabilities_before_in_flight(self):
+        engine = OrchestrationEngine()
+        agent_id = engine.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"capabilities": ["build"]},
+        )
+        task_id = engine.enqueue_task(
+            agent_id,
+            {"type": "build", "payload": {"secret": "not-logged"}},
+            required_capabilities=["build"],
+        )
+        assert engine.registry.refresh_capabilities_on_reconnect(
+            agent_id,
+            ["deploy"],
+        )
+
+        import asyncio
+        task = asyncio.run(engine.scheduler.dequeue())
+
+        assert task is None
+        assert task_id not in engine.scheduler._in_flight
+        assert task_id in engine.scheduler._deferred
+        deferred = engine.scheduler._deferred[task_id]
+        assert deferred["dispatch_decision"]["reason"] == (
+            "stale_worker_capabilities"
+        )
+        assert engine.dispatch_decisions[-1] == {
+            "task_id": task_id,
+            "target_agent": agent_id,
+            "allowed": False,
+            "reason": "stale_worker_capabilities",
+        }
+        assert "payload" not in engine.dispatch_decisions[-1]
 
 # 2019-01-09T19:07:03 update
 

@@ -14,10 +14,14 @@ logger = logging.getLogger(__name__)
 class OrchestrationEngine:
     def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
         self.registry = AgentRegistry()
-        self.scheduler = TaskScheduler()
+        self.scheduler = TaskScheduler(
+            dispatch_validator=self._validate_task_dispatch,
+            decision_recorder=self._record_dispatch_decision,
+        )
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
+        self.dispatch_decisions: List[Dict[str, Any]] = []
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
             "post_execute": [],
@@ -41,6 +45,56 @@ class OrchestrationEngine:
     def stop(self) -> None:
         self._running = False
         logger.info("Orchestration engine stopped")
+
+    def enqueue_task(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        required_capabilities: Optional[List[str]] = None,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        agent = self.registry.get(agent_id)
+        if not agent:
+            raise ValueError(f"Agent {agent_id} not found")
+
+        scheduled_task = dict(task)
+        scheduled_task["target_agent"] = agent_id
+        scheduled_task["required_capabilities"] = list(
+            required_capabilities or [],
+        )
+        scheduled_task["agent_capabilities_version"] = agent.get(
+            "capabilities_version",
+        )
+        return self.scheduler.enqueue(
+            scheduled_task,
+            queue=queue,
+            priority=priority,
+        )
+
+    def _validate_task_dispatch(
+        self,
+        task: Dict[str, Any],
+    ) -> tuple[bool, str]:
+        agent_id = task.get("target_agent")
+        if not agent_id:
+            return True, "accepted"
+        return self.registry.validate_task_assignment(agent_id, task)
+
+    def _record_dispatch_decision(
+        self,
+        task: Dict[str, Any],
+        reason: str,
+        allowed: bool,
+    ) -> None:
+        decision = {
+            "task_id": task.get("id"),
+            "target_agent": task.get("target_agent"),
+            "allowed": allowed,
+            "reason": reason,
+        }
+        self.dispatch_decisions.append(decision)
+        logger.info("Task dispatch decision: %s", decision)
 
     async def _execute_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
@@ -82,7 +136,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 

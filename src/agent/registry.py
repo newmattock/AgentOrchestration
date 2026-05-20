@@ -1,6 +1,5 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
@@ -22,15 +21,26 @@ class AgentRegistry:
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
+        config = dict(config or {})
+        capabilities = list(config.get("capabilities", []))
         self._agents[agent_id] = {
             "id": agent_id,
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": config,
+            "capabilities": capabilities,
+            "capabilities_version": 1,
+            "reconnect_count": 0,
+            "audit": [],
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -45,7 +55,11 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -60,6 +74,65 @@ class AgentRegistry:
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
         return True
+
+    def refresh_capabilities_on_reconnect(
+        self,
+        agent_id: str,
+        capabilities: List[str],
+    ) -> bool:
+        """Refresh capabilities after reconnect and advance routing version."""
+        if agent_id not in self._agents:
+            return False
+
+        agent = self._agents[agent_id]
+        previous = set(agent.get("capabilities", []))
+        current = set(capabilities)
+        agent["capabilities"] = list(capabilities)
+        agent["capabilities_version"] = (
+            agent.get("capabilities_version", 0) + 1
+        )
+        agent["reconnect_count"] = agent.get("reconnect_count", 0) + 1
+        agent["updated_at"] = time.time()
+        agent["audit"].append({
+            "event": "worker_capabilities_refreshed",
+            "agent_id": agent_id,
+            "capabilities_version": agent["capabilities_version"],
+            "added_count": len(current - previous),
+            "removed_count": len(previous - current),
+        })
+        return True
+
+    def validate_task_assignment(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+    ) -> tuple[bool, str]:
+        agent = self.get(agent_id)
+        if not agent:
+            return False, "agent_not_found"
+
+        unavailable = {
+            AgentStatus.STOPPED.value,
+            AgentStatus.FAILED.value,
+            AgentStatus.TERMINATED.value,
+        }
+        if agent["status"] in unavailable:
+            return False, "agent_not_available"
+
+        expected_version = task.get("agent_capabilities_version")
+        current_version = agent.get("capabilities_version")
+        if (
+            expected_version is not None
+            and expected_version != current_version
+        ):
+            return False, "stale_worker_capabilities"
+
+        required = set(task.get("required_capabilities", []))
+        agent_capabilities = set(agent.get("capabilities", []))
+        if required and not required.issubset(agent_capabilities):
+            return False, "missing_worker_capabilities"
+
+        return True, "accepted"
 
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:

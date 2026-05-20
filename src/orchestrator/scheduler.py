@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 from uuid import uuid4
 
 
@@ -31,30 +30,58 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        dispatch_validator: Optional[
+            Callable[[Dict], Tuple[bool, str]]
+        ] = None,
+        decision_recorder: Optional[Callable[[Dict, str, bool], None]] = None,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._deferred: Dict[str, Dict] = {}
+        self._completed = set()
+        self._retrying = set()
         self._max_retries = 3
+        self._dispatch_validator = dispatch_validator
+        self._decision_recorder = decision_recorder
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task = dict(task)
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task.setdefault("enqueued_at", time.time())
+        task.setdefault("retries", 0)
+        task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,21 +92,48 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                allowed, reason = self._validate_dispatch(task)
+                task["dispatch_decision"] = {
+                    "allowed": allowed,
+                    "reason": reason,
+                    "decided_at": time.time(),
+                }
+                self._record_decision(task, reason, allowed)
+                if not allowed:
+                    self._deferred[task["id"]] = task
+                    return None
+                self._retrying.discard(task["id"])
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        if task:
+            self._completed.add(task_id)
+            return True
+        return task_id in self._completed
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
+        if not task and task_id in self._retrying:
+            return True
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
+                self._retrying.add(task_id)
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def _validate_dispatch(self, task: Dict) -> Tuple[bool, str]:
+        if not self._dispatch_validator:
+            return True, "accepted"
+        return self._dispatch_validator(task)
+
+    def _record_decision(self, task: Dict, reason: str, allowed: bool) -> None:
+        if self._decision_recorder:
+            self._decision_recorder(task, reason, allowed)
 
 # 2019-04-25T08:37:12 update
 

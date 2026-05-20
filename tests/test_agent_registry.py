@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -39,6 +38,48 @@ class TestAgentRegistry:
         assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
         agent = self.registry.get(agent_id)
         assert agent["status"] == "running"
+
+    def test_refresh_capabilities_on_reconnect_advances_version(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"capabilities": ["build"]},
+        )
+        assert self.registry.refresh_capabilities_on_reconnect(
+            agent_id,
+            ["deploy"],
+        )
+
+        agent = self.registry.get(agent_id)
+        assert agent["capabilities"] == ["deploy"]
+        assert agent["capabilities_version"] == 2
+        assert agent["reconnect_count"] == 1
+        assert agent["audit"][-1]["event"] == "worker_capabilities_refreshed"
+        assert "capabilities" not in agent["audit"][-1]
+
+    def test_validate_task_assignment_rejects_stale_capability_version(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"capabilities": ["build"]},
+        )
+        task = {
+            "required_capabilities": ["build"],
+            "agent_capabilities_version": 1,
+        }
+        assert self.registry.validate_task_assignment(agent_id, task) == (
+            True,
+            "accepted",
+        )
+
+        assert self.registry.refresh_capabilities_on_reconnect(
+            agent_id,
+            ["deploy"],
+        )
+        assert self.registry.validate_task_assignment(agent_id, task) == (
+            False,
+            "stale_worker_capabilities",
+        )
 
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
