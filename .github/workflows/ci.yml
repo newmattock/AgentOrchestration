@@ -1,5 +1,9 @@
 name: CI
 
+# Third-party actions are pinned to reviewed full commit SHAs. Dependabot opens
+# reviewable GitHub Actions upgrade PRs; update the SHA and tag comment together.
+# Validate pins locally with: python3 scripts/validate_github_action_pins.py
+
 on:
   push:
     branches: [main, develop]
@@ -7,20 +11,29 @@ on:
     branches: [main]
 
 jobs:
+  validate-actions:
+    runs-on: ubuntu-latest
+    steps:
+      # Keep this bootstrap action pinned; the validator checks every workflow.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Validate pinned GitHub Actions
+        run: python3 scripts/validate_github_action_pins.py
+
   test:
     runs-on: ubuntu-latest
+    needs: validate-actions
     strategy:
       matrix:
         python-version: ["3.9", "3.10", "3.11"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
       - name: Install dependencies
         run: uv sync
       - name: Run tests
