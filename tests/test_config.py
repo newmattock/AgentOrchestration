@@ -47,6 +47,41 @@ class TestConfig:
             "flags": {"enabled": True},
         }
 
+    def test_init_copies_nested_values_from_caller(self):
+        caller_owned = {
+            "service": {
+                "limits": [1, 2],
+                "flags": {"enabled": True},
+            }
+        }
+
+        config = Config(data=caller_owned)
+        caller_owned["service"]["limits"].append(3)
+        caller_owned["service"]["flags"]["enabled"] = False
+
+        assert config.get("service") == {
+            "limits": [1, 2],
+            "flags": {"enabled": True},
+        }
+
+    def test_load_dict_copies_nested_values_from_caller(self):
+        config = Config()
+        caller_owned = {
+            "service": {
+                "limits": [1, 2],
+                "flags": {"enabled": True},
+            }
+        }
+
+        config.load_dict(caller_owned)
+        caller_owned["service"]["limits"].append(3)
+        caller_owned["service"]["flags"]["enabled"] = False
+
+        assert config.get("service") == {
+            "limits": [1, 2],
+            "flags": {"enabled": True},
+        }
+
     def test_get_returns_copy_of_nested_values(self):
         config = Config()
         config.set("service", {"limits": [1, 2]})

@@ -11,15 +11,24 @@ def _copy_config_value(value: Any) -> Any:
 
 
 class Config:
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        data: Optional[Dict[str, Any]] = None,
+    ):
         self._data: Dict[str, Any] = {}
+        if data is not None:
+            self.load_dict(data)
         if config_path:
             self.load(config_path)
         self._load_env_overrides()
 
     def load(self, path: str) -> None:
         with open(path) as f:
-            self._data = _copy_config_value(json.load(f))
+            self.load_dict(json.load(f))
+
+    def load_dict(self, data: Dict[str, Any]) -> None:
+        self._data = _copy_config_value(data)
 
     def _load_env_overrides(self) -> None:
         prefix = "AO_"
