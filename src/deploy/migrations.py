@@ -615,6 +615,28 @@ class MigrationRunner:
 
     def run(self, job: MigrationJob, *, owner: str) -> MigrationResult:
         owner = self._normalize_owner(owner)
+        return self._run_normalized(job, owner)
+
+    def run_many(
+        self,
+        jobs: List[MigrationJob],
+        *,
+        owner: str,
+    ) -> List[MigrationResult]:
+        owner = self._normalize_owner(owner)
+        results = []
+        for job in jobs:
+            result = self._run_normalized(job, owner)
+            results.append(result)
+            if result.status == "locked":
+                break
+        return results
+
+    def _run_normalized(
+        self,
+        job: MigrationJob,
+        owner: str,
+    ) -> MigrationResult:
         self._validate_declaration(job, owner)
 
         begin = self.store.begin(job.identifier, owner)

@@ -153,6 +153,46 @@ def test_deployment_retries_resume_from_recorded_migration_state(tmp_path):
     assert executions == ["first"]
 
 
+def test_deployment_batch_retries_skip_completed_migrations(tmp_path):
+    database_path = str(tmp_path / "migrations.sqlite")
+    store = SQLiteMigrationStateStore(database_path)
+    runner = MigrationRunner(store)
+    calls = []
+    attempts = {"second": 0}
+
+    def flaky_second():
+        attempts["second"] += 1
+        calls.append("second")
+        if attempts["second"] == 1:
+            raise RuntimeError("transient database timeout")
+
+    first = MigrationJob(
+        "20260520_create_accounts",
+        lambda: calls.append("first"),
+        single_run=True,
+    )
+    second = MigrationJob(
+        "20260520_backfill_accounts",
+        flaky_second,
+        idempotent=True,
+    )
+
+    with pytest.raises(RuntimeError):
+        runner.run_many([first, second], owner="deploy-a")
+
+    store.close()
+    retry_runner = MigrationRunner(SQLiteMigrationStateStore(database_path))
+    retry_results = retry_runner.run_many([first, second], owner="deploy-b")
+
+    assert [result.status for result in retry_results] == [
+        "skipped",
+        "completed",
+    ]
+    assert [result.ran for result in retry_results] == [False, True]
+    assert retry_results[0].lock_owner == "deploy-a"
+    assert calls == ["first", "second", "second"]
+
+
 def test_migrations_must_declare_idempotent_or_single_run_behavior(tmp_path):
     store = _store(tmp_path)
     runner = MigrationRunner(store)
