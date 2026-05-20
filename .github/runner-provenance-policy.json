@@ -1,0 +1,15 @@
+{
+  "approved_runner_labels": [
+    "Linux",
+    "X64",
+    "github-hosted",
+    "self-hosted",
+    "linux",
+    "x64",
+    "ci",
+    "build",
+    "release"
+  ],
+  "max_image_age_hours": 168,
+  "required_runner_labels": []
+}

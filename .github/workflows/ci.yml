@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main, develop]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -15,6 +16,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Validate runner provenance
+        run: python3 scripts/validate_runner_provenance.py --policy .github/runner-provenance-policy.json
+        env:
+          RUNNER_PROVENANCE_LABELS: ${{ runner.os }},${{ runner.arch }},${{ runner.environment }}
+          RUNNER_IMAGE_DIGEST: ${{ vars.RUNNER_IMAGE_DIGEST }}
+          RUNNER_IMAGE_BUILT_AT: ${{ vars.RUNNER_IMAGE_BUILT_AT }}
+          RUNNER_APPROVED_IMAGE_DIGESTS: ${{ vars.RUNNER_APPROVED_IMAGE_DIGESTS }}
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -27,3 +35,28 @@ jobs:
         run: uv run pytest --cov=src tests/
       - name: Lint
         run: uv run flake8 src/ tests/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release runner provenance
+        run: python3 scripts/validate_runner_provenance.py --policy .github/runner-provenance-policy.json --strict
+        env:
+          RUNNER_PROVENANCE_LABELS: ${{ runner.os }},${{ runner.arch }},${{ runner.environment }},release
+          RUNNER_IMAGE_DIGEST: ${{ vars.RUNNER_IMAGE_DIGEST }}
+          RUNNER_IMAGE_BUILT_AT: ${{ vars.RUNNER_IMAGE_BUILT_AT }}
+          RUNNER_APPROVED_IMAGE_DIGESTS: ${{ vars.RUNNER_APPROVED_IMAGE_DIGESTS }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Install dependencies
+        run: uv sync
+      - name: Build release package
+        run: uv build
