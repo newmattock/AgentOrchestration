@@ -4,6 +4,8 @@ import os
 import json
 from typing import Any, Dict, Optional
 
+from src.common.errors import ConfigurationError
+
 
 class Config:
     def __init__(self, config_path: Optional[str] = None):
@@ -43,6 +45,23 @@ class Config:
             else:
                 return default
         return current
+
+    def get_int(self, key: str, default: Any = None) -> Optional[int]:
+        value = self.get(key, default)
+        if value is None:
+            return None
+        return self._coerce_int(key, value)
+
+    def _coerce_int(self, key: str, value: Any) -> int:
+        if isinstance(value, bool):
+            raise ConfigurationError(f"Config value {key} must be an integer")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and stripped.lstrip("+-").isdigit():
+                return int(stripped, 10)
+        raise ConfigurationError(f"Config value {key} must be an integer")
 
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
