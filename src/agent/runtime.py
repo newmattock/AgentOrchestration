@@ -77,9 +77,14 @@ class AgentRuntime:
         if proc:
             exit_code = proc.poll()
             if exit_code is not None:
+                current_state = self._states.get(agent_id)
+                was_intentionally_stopped = current_state in {
+                    RuntimeState.STOPPING,
+                    RuntimeState.STOPPED,
+                }
                 self._states[agent_id] = (
                     RuntimeState.STOPPED
-                    if exit_code == 0
+                    if exit_code == 0 or was_intentionally_stopped
                     else RuntimeState.CRASHED
                 )
         return self._states.get(agent_id, RuntimeState.STOPPED)

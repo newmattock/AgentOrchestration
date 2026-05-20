@@ -35,3 +35,21 @@ def test_get_state_preserves_nonzero_process_exit_as_crashed():
     runtime._processes["agent-1"].wait(timeout=5)
 
     assert runtime.get_state("agent-1") == RuntimeState.CRASHED
+
+
+def test_get_state_keeps_intentionally_stopped_process_stopped():
+    runtime = AgentRuntime()
+
+    assert runtime.start(
+        "agent-1",
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+
+    try:
+        assert runtime.stop("agent-1", timeout=2)
+        assert runtime.get_state("agent-1") == RuntimeState.STOPPED
+    finally:
+        proc = runtime._processes["agent-1"]
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
