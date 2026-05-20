@@ -245,3 +245,57 @@ def test_failure_releases_lock_without_recording_completion(tmp_path):
     assert retry.ran
     assert attempts == ["failed", "retried"]
     assert store.completion_for("20260520_retryable_migration") is not None
+    assert store.failure_for("20260520_retryable_migration") is None
+
+
+def test_failed_single_run_migration_is_rejected_on_retry(tmp_path):
+    database_path = str(tmp_path / "migrations.sqlite")
+    store = SQLiteMigrationStateStore(database_path)
+    runner = MigrationRunner(store)
+    attempts = []
+
+    def fail_once():
+        attempts.append("failed")
+        raise RuntimeError("partially applied schema change")
+
+    with pytest.raises(RuntimeError):
+        runner.run(
+            MigrationJob(
+                "20260520_non_idempotent_index",
+                fail_once,
+                single_run=True,
+            ),
+            owner="deploy-a",
+        )
+
+    failure = store.failure_for("20260520_non_idempotent_index")
+    assert failure is not None
+    assert failure.owner == "deploy-a"
+    assert failure.error_type == "RuntimeError"
+    store.close()
+
+    retry_store = SQLiteMigrationStateStore(database_path)
+    retry_runner = MigrationRunner(retry_store)
+    retry = retry_runner.run(
+        MigrationJob(
+            "20260520_non_idempotent_index",
+            lambda: attempts.append("retried"),
+            single_run=True,
+        ),
+        owner="deploy-b",
+    )
+
+    logs = retry_store.logs("20260520_non_idempotent_index")
+    assert retry.status == "rejected"
+    assert not retry.ran
+    assert retry.failure is not None
+    assert retry.failure.owner == "deploy-a"
+    assert retry.lock_owner == "deploy-a"
+    assert "cannot be retried" in retry.detail
+    assert attempts == ["failed"]
+    assert any(entry.event == "failed" for entry in logs)
+    assert any(
+        entry.event == "rejected"
+        and "cannot be retried" in entry.detail
+        for entry in logs
+    )

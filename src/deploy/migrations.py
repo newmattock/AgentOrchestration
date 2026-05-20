@@ -52,6 +52,15 @@ class MigrationCompletion:
 
 
 @dataclass(frozen=True)
+class MigrationFailure:
+    migration_id: str
+    owner: str
+    failed_at: float
+    error_type: str
+    status: str = "failed"
+
+
+@dataclass(frozen=True)
 class MigrationBeginState:
     migration_id: str
     owner: str
@@ -79,7 +88,9 @@ class MigrationResult:
     status: str
     ran: bool
     completion: Optional[MigrationCompletion] = None
+    failure: Optional[MigrationFailure] = None
     lock_owner: Optional[str] = None
+    detail: Optional[str] = None
     value: Any = None
 
 
@@ -102,6 +113,12 @@ class MigrationStateStore(Protocol):
     ) -> Optional[MigrationCompletion]:
         ...
 
+    def failure_for(
+        self,
+        migration_id: str,
+    ) -> Optional[MigrationFailure]:
+        ...
+
     def lock_for(self, migration_id: str) -> Optional[MigrationLock]:
         ...
 
@@ -120,6 +137,7 @@ class InMemoryMigrationStateStore:
         self._mutex = RLock()
         self._locks: Dict[str, MigrationLock] = {}
         self._completions: Dict[str, MigrationCompletion] = {}
+        self._failures: Dict[str, MigrationFailure] = {}
         self._logs: List[MigrationLogEntry] = []
 
     def begin(self, migration_id: str, owner: str) -> MigrationBeginState:
@@ -185,6 +203,7 @@ class InMemoryMigrationStateStore:
                 completed_at=self._clock(),
             )
             self._completions[migration_id] = completion
+            self._failures.pop(migration_id, None)
             self._locks.pop(migration_id, None)
             self._append_log(
                 migration_id,
@@ -198,6 +217,13 @@ class InMemoryMigrationStateStore:
     def fail(self, migration_id: str, owner: str, error_type: str) -> None:
         with self._mutex:
             self._require_lock_owner(migration_id, owner)
+            failure = MigrationFailure(
+                migration_id=migration_id,
+                owner=owner,
+                failed_at=self._clock(),
+                error_type=error_type,
+            )
+            self._failures[migration_id] = failure
             self._locks.pop(migration_id, None)
             self._append_log(
                 migration_id,
@@ -224,6 +250,13 @@ class InMemoryMigrationStateStore:
     ) -> Optional[MigrationCompletion]:
         with self._mutex:
             return self._completions.get(migration_id)
+
+    def failure_for(
+        self,
+        migration_id: str,
+    ) -> Optional[MigrationFailure]:
+        with self._mutex:
+            return self._failures.get(migration_id)
 
     def lock_for(self, migration_id: str) -> Optional[MigrationLock]:
         with self._mutex:
@@ -381,6 +414,10 @@ class SQLiteMigrationStateStore:
                 "DELETE FROM migration_locks WHERE migration_id = ?",
                 (migration_id,),
             )
+            connection.execute(
+                "DELETE FROM migration_failures WHERE migration_id = ?",
+                (migration_id,),
+            )
             self._append_log(
                 connection,
                 migration_id,
@@ -394,6 +431,21 @@ class SQLiteMigrationStateStore:
     def fail(self, migration_id: str, owner: str, error_type: str) -> None:
         with self._transaction() as connection:
             self._require_lock_owner(connection, migration_id, owner)
+            failed_at = self._clock()
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO migration_failures
+                    (migration_id, owner, failed_at, error_type, status)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    migration_id,
+                    owner,
+                    failed_at,
+                    error_type,
+                    "failed",
+                ),
+            )
             connection.execute(
                 "DELETE FROM migration_locks WHERE migration_id = ?",
                 (migration_id,),
@@ -425,6 +477,13 @@ class SQLiteMigrationStateStore:
     ) -> Optional[MigrationCompletion]:
         with self._mutex:
             return self._select_completion(self._connection, migration_id)
+
+    def failure_for(
+        self,
+        migration_id: str,
+    ) -> Optional[MigrationFailure]:
+        with self._mutex:
+            return self._select_failure(self._connection, migration_id)
 
     def lock_for(self, migration_id: str) -> Optional[MigrationLock]:
         with self._mutex:
@@ -475,6 +534,14 @@ class SQLiteMigrationStateStore:
                     migration_id TEXT PRIMARY KEY,
                     owner TEXT NOT NULL,
                     completed_at REAL NOT NULL,
+                    status TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS migration_failures (
+                    migration_id TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    failed_at REAL NOT NULL,
+                    error_type TEXT NOT NULL,
                     status TEXT NOT NULL
                 );
 
@@ -571,6 +638,29 @@ class SQLiteMigrationStateStore:
         )
 
     @staticmethod
+    def _select_failure(
+        connection: sqlite3.Connection,
+        migration_id: str,
+    ) -> Optional[MigrationFailure]:
+        row = connection.execute(
+            """
+            SELECT migration_id, owner, failed_at, error_type, status
+            FROM migration_failures
+            WHERE migration_id = ?
+            """,
+            (migration_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return MigrationFailure(
+            migration_id=row["migration_id"],
+            owner=row["owner"],
+            failed_at=row["failed_at"],
+            error_type=row["error_type"],
+            status=row["status"],
+        )
+
+    @staticmethod
     def _select_lock(
         connection: sqlite3.Connection,
         migration_id: str,
@@ -638,6 +728,23 @@ class MigrationRunner:
         owner: str,
     ) -> MigrationResult:
         self._validate_declaration(job, owner)
+        if job.single_run:
+            failure = self.store.failure_for(job.identifier)
+            if failure is not None:
+                detail = (
+                    "single-run migration failed previously and cannot "
+                    "be retried without idempotent=True"
+                )
+                self.store.reject(job.identifier, owner, detail)
+                return MigrationResult(
+                    migration_id=job.identifier,
+                    owner=owner,
+                    status="rejected",
+                    ran=False,
+                    failure=failure,
+                    lock_owner=failure.owner,
+                    detail=detail,
+                )
 
         begin = self.store.begin(job.identifier, owner)
         if begin.already_completed:
