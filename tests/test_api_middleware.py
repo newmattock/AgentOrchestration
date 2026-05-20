@@ -52,11 +52,33 @@ def test_cors_preflight_passes_to_cors_middleware_without_auth():
 def test_real_options_request_without_preflight_headers_requires_auth():
     client = TestClient(create_app())
 
-    response = client.options("/api/v2/agents")
+    response = client.options(
+        "/api/v2/agents",
+        headers={"Origin": "https://console.example"},
+    )
 
     assert response.status_code == 401
     assert response.text == "Unauthorized"
-    assert "access-control-allow-origin" not in response.headers
+    assert (
+        response.headers["access-control-allow-origin"]
+        == "https://console.example"
+    )
+
+
+def test_real_cors_request_requires_auth_and_keeps_cors_headers():
+    client = TestClient(create_app())
+
+    response = client.get(
+        "/api/v2/agents",
+        headers={"Origin": "https://console.example"},
+    )
+
+    assert response.status_code == 401
+    assert response.text == "Unauthorized"
+    assert (
+        response.headers["access-control-allow-origin"]
+        == "https://console.example"
+    )
 
 
 def test_authenticated_request_reaches_handler_and_logs_without_token(caplog):
