@@ -1,22 +1,31 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException, Request
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.artifacts import ArtifactIngestionService
 
 router = APIRouter()
 registry = AgentRegistry()
+artifact_service = ArtifactIngestionService()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +62,49 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/artifacts/{artifact_id}/upload")
+async def upload_default_workspace_artifact(
+    artifact_id: str,
+    request: Request,
+):
+    return await _upload_artifact(
+        "default",
+        artifact_id,
+        request,
+    )
+
+
+@router.post("/workspaces/{workspace_id}/artifacts/{artifact_id}/upload")
+async def upload_artifact(
+    workspace_id: str,
+    artifact_id: str,
+    request: Request,
+):
+    return await _upload_artifact(
+        workspace_id,
+        artifact_id,
+        request,
+    )
+
+
+async def _upload_artifact(
+    workspace_id: str,
+    artifact_id: str,
+    request: Request,
+):
+    record = await artifact_service.ingest(
+        workspace_id=workspace_id,
+        artifact_id=artifact_id,
+        content_type=request.headers.get(
+            "content-type",
+            "application/octet-stream",
+        ),
+        content_length=request.headers.get("content-length"),
+        body_stream=request.stream(),
+    )
+    return {"status": "stored", **record}
 
 # 2019-03-18T11:10:18 update
 
