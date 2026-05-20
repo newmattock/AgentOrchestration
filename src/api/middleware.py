@@ -9,14 +9,80 @@ from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+AUTH_DECISION_HEADER = "X-Auth-Decision"
+PROTECTED_API_PREFIX = "/api/v2"
+TOKEN_PATH = "/api/v2/auth/token"
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        try:
+            if not self._requires_auth(request):
+                return await call_next(request)
+
+            if self._is_cors_preflight(request):
+                request.state.auth_context = {
+                    "authenticated": False,
+                    "cors_preflight": True,
+                }
+                response = await call_next(request)
+                response.headers[AUTH_DECISION_HEADER] = "cors-preflight"
+                logger.info(
+                    "allowed CORS preflight",
+                    extra={
+                        "method": request.method,
+                        "path": request.url.path,
+                    },
+                )
+                return response
+
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
-        return await call_next(request)
+                logger.warning(
+                    "rejected unauthenticated API request",
+                    extra={
+                        "method": request.method,
+                        "path": request.url.path,
+                    },
+                )
+                return Response(
+                    status_code=401,
+                    content="Unauthorized",
+                    headers={
+                        "WWW-Authenticate": "Bearer",
+                        AUTH_DECISION_HEADER: "rejected",
+                    },
+                )
+
+            request.state.auth_context = {
+                "authenticated": True,
+                "cors_preflight": False,
+                "scheme": "bearer",
+            }
+            response = await call_next(request)
+            response.headers[AUTH_DECISION_HEADER] = "accepted"
+            return response
+        finally:
+            self._clear_auth_state(request)
+
+    def _requires_auth(self, request: Request) -> bool:
+        path = request.url.path
+        return path.startswith(PROTECTED_API_PREFIX) and path != TOKEN_PATH
+
+    def _is_cors_preflight(self, request: Request) -> bool:
+        return (
+            request.method == "OPTIONS"
+            and "origin" in request.headers
+            and "access-control-request-method" in request.headers
+        )
+
+    def _clear_auth_state(self, request: Request) -> None:
+        if hasattr(request.state, "auth_context"):
+            delattr(request.state, "auth_context")
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +92,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +116,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
