@@ -2,11 +2,12 @@
 
 import time
 import logging
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +34,12 @@ class RateLimitMiddleware:
         app: ASGIApp,
         max_requests: int = 100,
         window: int = 60,
+        time_provider: Optional[Callable[[], float]] = None,
     ):
         self.app = app
         self.max_requests = max_requests
         self.window = window
+        self._time_provider = time_provider or time.time
         self._requests: Dict[str, List[float]] = {}
 
     async def __call__(
@@ -52,7 +55,7 @@ class RateLimitMiddleware:
         state = scope.setdefault("state", {})
         client = scope.get("client")
         client_ip = client[0] if client else "unknown"
-        now = time.time()
+        now = self._time_provider()
         timestamps = [
             timestamp
             for timestamp in self._requests.get(client_ip, [])
@@ -80,6 +83,7 @@ class RateLimitMiddleware:
                         "Retry-After": str(retry_after),
                         "X-RateLimit-Limit": str(self.max_requests),
                         "X-RateLimit-Remaining": "0",
+                        "X-RateLimit-Window": str(self.window),
                         "X-RateLimit-Decision": "limited",
                     },
                 )
@@ -87,11 +91,22 @@ class RateLimitMiddleware:
                 return
 
             timestamps.append(now)
+            remaining = max(0, self.max_requests - len(timestamps))
             state["rate_limit"] = {
                 "allowed": True,
-                "remaining": max(0, self.max_requests - len(timestamps)),
+                "remaining": remaining,
             }
-            await self.app(scope, receive, send)
+
+            async def send_with_rate_limit_headers(message: Message) -> None:
+                if message["type"] == "http.response.start":
+                    headers = MutableHeaders(scope=message)
+                    headers["X-RateLimit-Limit"] = str(self.max_requests)
+                    headers["X-RateLimit-Remaining"] = str(remaining)
+                    headers["X-RateLimit-Window"] = str(self.window)
+                    headers["X-RateLimit-Decision"] = "allowed"
+                await send(message)
+
+            await self.app(scope, receive, send_with_rate_limit_headers)
         finally:
             state.pop("rate_limit", None)
 

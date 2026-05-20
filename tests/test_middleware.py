@@ -11,19 +11,23 @@ from src.api.server import create_app
 class BodyReadingApp:
     def __init__(self):
         self.body_reads = 0
+        self.body_bytes = 0
         self.scopes = []
 
     async def __call__(self, scope, receive, send):
         self.scopes.append(scope)
         assert scope["state"]["rate_limit"]["allowed"] is True
+        body = b""
         while True:
             message = await receive()
             if message["type"] == "http.request":
+                body += message.get("body", b"")
                 if not message.get("more_body", False):
                     break
             elif message["type"] == "http.disconnect":
                 break
         self.body_reads += 1
+        self.body_bytes += len(body)
         response = Response("ok")
         await response(scope, receive, send)
 
@@ -49,17 +53,31 @@ def test_create_app_places_rate_limit_first_in_ingress_stack():
 
 
 def test_rate_limit_rejects_before_downstream_body_read():
+    current_time = [100.0]
     app = BodyReadingApp()
-    client = TestClient(RateLimitMiddleware(app, max_requests=1, window=60))
+    client = TestClient(
+        RateLimitMiddleware(
+            app,
+            max_requests=1,
+            window=60,
+            time_provider=lambda: current_time[0],
+        )
+    )
 
     accepted = client.post("/api/v2/agents", content=b"first")
     rejected = client.post("/api/v2/agents", content=b"second-secret")
 
     assert accepted.status_code == 200
+    assert accepted.headers["x-ratelimit-decision"] == "allowed"
+    assert accepted.headers["x-ratelimit-limit"] == "1"
+    assert accepted.headers["x-ratelimit-remaining"] == "0"
+    assert accepted.headers["x-ratelimit-window"] == "60"
     assert rejected.status_code == 429
     assert rejected.headers["x-ratelimit-decision"] == "limited"
     assert rejected.headers["x-ratelimit-remaining"] == "0"
+    assert rejected.headers["retry-after"] == "60"
     assert app.body_reads == 1
+    assert app.body_bytes == len(b"first")
     assert "rate_limit" not in app.scopes[0]["state"]
 
 
