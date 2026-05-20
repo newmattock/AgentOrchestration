@@ -20,14 +20,15 @@ def create_app(config: Dict = None) -> FastAPI:
         redoc_url="/api/redoc",
     )
 
+    app.add_middleware(RateLimitMiddleware)
+    app.add_middleware(AuthMiddleware)
     app.add_middleware(
         TrustedHostMiddleware,
         allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","),
     )
-
-    app.add_middleware(AuthMiddleware)
-    app.add_middleware(RateLimitMiddleware)
     app.add_middleware(LoggingMiddleware)
+    # Starlette runs last-added middleware first; keep CORS outermost while
+    # authentication still rejects real calls before rate-limit state changes.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),

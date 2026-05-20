@@ -98,6 +98,38 @@ def test_authenticated_request_reaches_handler_and_logs_without_token(caplog):
     assert "Authorization" not in caplog.text
 
 
+def test_preflight_and_auth_rejections_do_not_consume_rate_limit():
+    client = TestClient(create_app())
+    preflight_headers = {
+        "Origin": "https://console.example",
+        "Access-Control-Request-Method": "GET",
+    }
+    real_request_headers = {"Origin": "https://console.example"}
+
+    for _ in range(105):
+        preflight = client.options(
+            "/api/v2/agents",
+            headers=preflight_headers,
+        )
+        rejected = client.get(
+            "/api/v2/agents",
+            headers=real_request_headers,
+        )
+
+        assert preflight.status_code == 200
+        assert rejected.status_code == 401
+
+    authenticated = client.get(
+        "/api/v2/agents",
+        headers={
+            "Origin": "https://console.example",
+            "Authorization": "Bearer test-token",
+        },
+    )
+
+    assert authenticated.status_code == 200
+
+
 def test_auth_request_state_is_cleared_after_success():
     middleware = AuthMiddleware(app=None)
     request = _request(
