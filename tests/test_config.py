@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,40 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_set_copies_nested_values_from_caller(self):
+        config = Config()
+        caller_owned = {
+            "limits": [1, 2],
+            "flags": {"enabled": True},
+        }
+
+        config.set("service", caller_owned)
+        caller_owned["limits"].append(3)
+        caller_owned["flags"]["enabled"] = False
+
+        assert config.get("service") == {
+            "limits": [1, 2],
+            "flags": {"enabled": True},
+        }
+
+    def test_get_returns_copy_of_nested_values(self):
+        config = Config()
+        config.set("service", {"limits": [1, 2]})
+
+        fetched = config.get("service")
+        fetched["limits"].append(3)
+
+        assert config.get("service.limits") == [1, 2]
+
+    def test_to_dict_returns_copy_of_nested_values(self):
+        config = Config()
+        config.set("service", {"flags": {"enabled": True}})
+
+        snapshot = config.to_dict()
+        snapshot["service"]["flags"]["enabled"] = False
+
+        assert config.get("service.flags.enabled") is True
 
 # 2019-02-01T18:58:35 update
 
