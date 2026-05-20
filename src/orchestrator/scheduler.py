@@ -114,6 +114,20 @@ class TaskScheduler:
     def complete(self, task_id: str) -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
+            allowed, reason = self._validate_dispatch(task)
+            if not allowed:
+                task["completion_decision"] = {
+                    "allowed": False,
+                    "reason": reason,
+                    "decided_at": time.time(),
+                }
+                self._record_decision(task, reason, False)
+                metrics.increment(f"scheduler.completion.requeued.{reason}")
+                self.enqueue(
+                    task,
+                    priority=task.get("priority", 0),
+                )
+                return False
             self._completed.add(task_id)
             return True
         return task_id in self._completed

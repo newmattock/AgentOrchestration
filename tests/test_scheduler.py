@@ -85,6 +85,50 @@ class TestTaskScheduler:
         assert after_count == before_count + 1
         assert "payload" not in engine.dispatch_decisions[-1]
 
+    def test_reconnect_requeues_stale_in_flight_completion(self):
+        engine = OrchestrationEngine()
+        agent_id = engine.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"capabilities": ["build"]},
+        )
+        task_id = engine.enqueue_task(
+            agent_id,
+            {"type": "build", "payload": {"secret": "not-logged"}},
+            required_capabilities=["build"],
+        )
+
+        import asyncio
+        task = asyncio.run(engine.scheduler.dequeue())
+        assert task["id"] == task_id
+        assert task_id in engine.scheduler._in_flight
+        assert engine.registry.refresh_capabilities_on_reconnect(
+            agent_id,
+            ["deploy"],
+        )
+        metric_name = "scheduler.completion.requeued.stale_worker_capabilities"
+        before_count = metrics.snapshot()["counters"].get(metric_name, 0)
+
+        assert not engine.scheduler.complete(task_id)
+
+        assert task_id not in engine.scheduler._completed
+        assert task_id not in engine.scheduler._in_flight
+        assert len(engine.scheduler._queues["default"]) == 1
+        requeued = engine.scheduler._queues["default"].peek()
+        assert requeued["id"] == task_id
+        assert requeued["completion_decision"]["reason"] == (
+            "stale_worker_capabilities"
+        )
+        assert engine.dispatch_decisions[-1] == {
+            "task_id": task_id,
+            "target_agent": agent_id,
+            "allowed": False,
+            "reason": "stale_worker_capabilities",
+        }
+        after_count = metrics.snapshot()["counters"].get(metric_name, 0)
+        assert after_count == before_count + 1
+        assert "payload" not in engine.dispatch_decisions[-1]
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update
