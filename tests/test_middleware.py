@@ -19,6 +19,11 @@ def build_app(seen):
         seen["non_preflight_state"] = request.state
         return {"ok": True}
 
+    @app.post("/api/v2/auth/token")
+    async def token(request: Request):
+        seen["token_state"] = request.state
+        return {"token": "issued"}
+
     @app.get("/api/v2/error")
     async def error(request: Request):
         seen["error_state"] = request.state
@@ -82,6 +87,20 @@ def test_real_api_request_requires_bearer_before_handler():
     assert "secure_state" not in seen
 
 
+def test_real_cors_api_request_requires_bearer_before_handler():
+    seen = {}
+    client = TestClient(build_app(seen))
+
+    response = client.get(
+        "/api/v2/secure",
+        headers={"Origin": "https://client.example"},
+    )
+
+    assert response.status_code == 401
+    assert response.headers[AUTH_DECISION_HEADER] == "rejected"
+    assert "secure_state" not in seen
+
+
 def test_authenticated_request_sets_and_clears_request_state():
     seen = {}
     client = TestClient(build_app(seen))
@@ -139,3 +158,15 @@ def test_unprotected_routes_skip_auth():
 
     assert response.status_code == 200
     assert AUTH_DECISION_HEADER not in response.headers
+
+
+def test_token_route_skips_auth():
+    seen = {}
+    client = TestClient(build_app(seen))
+
+    response = client.post("/api/v2/auth/token")
+
+    assert response.status_code == 200
+    assert response.json() == {"token": "issued"}
+    assert AUTH_DECISION_HEADER not in response.headers
+    assert not hasattr(seen["token_state"], "auth_context")
