@@ -1,4 +1,6 @@
 import argparse
+import subprocess
+import sys
 
 from src.cli.main import ERROR, SUCCESS, USAGE_ERROR, cli, handle_deploy
 
@@ -107,3 +109,57 @@ def test_deploy_cli_returns_usage_error_for_missing_manifest(capsys):
     captured = capsys.readouterr()
     assert exit_code == USAGE_ERROR
     assert "Deploy failed: could not read manifest" in captured.err
+
+
+def test_deploy_cli_returns_usage_error_for_invalid_json_manifest(
+    tmp_path,
+    capsys,
+):
+    manifest = tmp_path / "agent.json"
+    manifest.write_text('{"name": ')
+
+    exit_code = cli(
+        ["deploy", str(manifest)],
+        client_factory=SuccessfulDeployClient,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == USAGE_ERROR
+    assert "Deploy failed: invalid JSON manifest" in captured.err
+
+
+def test_deploy_cli_returns_usage_error_for_non_object_manifest(
+    tmp_path,
+    capsys,
+):
+    manifest = tmp_path / "agent.json"
+    manifest.write_text('["worker"]')
+
+    exit_code = cli(
+        ["deploy", str(manifest)],
+        client_factory=SuccessfulDeployClient,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == USAGE_ERROR
+    assert "manifest root must be a JSON/YAML object" in captured.err
+
+
+def test_module_entry_uses_cli_return_code(tmp_path):
+    missing_manifest = tmp_path / "missing.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "src.cli.main",
+            "deploy",
+            str(missing_manifest),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == USAGE_ERROR
+    assert "Deploy failed: could not read manifest" in result.stderr
