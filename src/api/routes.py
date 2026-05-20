@@ -1,22 +1,47 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from typing import List, Dict, Optional
 
+from .auth import IntegrationAuthError, get_integration_auth_service
 from src.agent import AgentRegistry, AgentStatus
 
 router = APIRouter()
 registry = AgentRegistry()
+webhook_registry: Dict[str, List[Dict]] = {}
+
+
+def require_webhook_manager(workspace_id: str, request: Request):
+    service = get_integration_auth_service(request)
+    try:
+        return service.require_workspace_permission(
+            request=request,
+            workspace_id=workspace_id,
+            required_scope="webhooks:manage",
+            allowed_roles={"owner", "admin"},
+        )
+    except IntegrationAuthError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+        ) from exc
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +78,34 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.get("/workspaces/{workspace_id}/webhooks")
+async def list_workspace_webhooks(
+    workspace_id: str,
+    principal=Depends(require_webhook_manager),
+):
+    return {
+        "workspace_id": workspace_id,
+        "principal_id": principal.principal_id,
+        "webhooks": webhook_registry.get(workspace_id, []),
+    }
+
+
+@router.post("/workspaces/{workspace_id}/webhooks")
+async def create_workspace_webhook(
+    workspace_id: str,
+    webhook: Dict,
+    principal=Depends(require_webhook_manager),
+):
+    stored = {
+        "id": f"webhook-{len(webhook_registry.get(workspace_id, [])) + 1}",
+        "created_by": principal.principal_id,
+        "url": webhook.get("url"),
+        "events": list(webhook.get("events", [])),
+    }
+    webhook_registry.setdefault(workspace_id, []).append(stored)
+    return {"workspace_id": workspace_id, "webhook": stored}
 
 # 2019-03-18T11:10:18 update
 
