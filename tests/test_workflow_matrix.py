@@ -103,6 +103,28 @@ def test_late_matrix_mutation_is_rejected_before_dispatch():
     }
 
 
+def test_duplicate_matrix_values_are_rejected_without_value_logging():
+    workflow = WorkflowManager().create_workflow("deploy")
+    step = WorkflowStep(
+        "fanout",
+        noop,
+        matrix={"region": ["us", "us"]},
+    )
+
+    with pytest.raises(WorkflowMatrixError):
+        workflow.add_step(step)
+
+    assert workflow.steps == []
+    assert workflow.audit_log[-1] == {
+        "event": "workflow_step_rejected",
+        "workflow_id": workflow.id,
+        "step_id": step.id,
+        "step_name": "fanout",
+        "reason": "duplicate_matrix_dimension_values",
+        "details": {"dimension": "region"},
+    }
+
+
 def test_rejects_graph_changes_after_execution_started():
     workflow = WorkflowManager().create_workflow("deploy")
     workflow.status = StepStatus.RUNNING

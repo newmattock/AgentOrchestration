@@ -157,6 +157,15 @@ class Workflow:
             raise WorkflowMatrixError(
                 f"matrix dimension {dimension!r} must not be empty"
             )
+        if len({repr(value) for value in values}) != len(values):
+            self._record_rejection(
+                step,
+                "duplicate_matrix_dimension_values",
+                {"dimension": str(dimension)},
+            )
+            raise WorkflowMatrixError(
+                f"matrix dimension {dimension!r} must not contain duplicates"
+            )
         return values
 
     def _record_rejection(
