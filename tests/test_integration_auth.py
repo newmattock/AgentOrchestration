@@ -135,6 +135,36 @@ def test_webhook_management_rejects_disabled_browser_session():
     assert webhook_registry == {}
 
 
+def test_webhook_management_rejects_disabled_integration_session_header():
+    service = IntegrationAuthService(allow_legacy_bearer=False)
+    service.register_session("session-a", credential(disabled=True))
+    client = build_client(service)
+
+    response = post_webhook(
+        client,
+        headers={"x-integration-session": "session-a"},
+    )
+
+    assert response.status_code == 401
+    assert "Principal is disabled" in response.text
+    assert webhook_registry == {}
+
+
+def test_webhook_management_rejects_malformed_integration_session_header():
+    service = IntegrationAuthService(allow_legacy_bearer=False)
+    service.register_session("session-a", credential())
+    client = build_client(service)
+
+    response = post_webhook(
+        client,
+        headers={"x-integration-session": " "},
+    )
+
+    assert response.status_code == 401
+    assert "Malformed integration session header" in response.text
+    assert webhook_registry == {}
+
+
 def test_authorized_token_principal_can_manage_webhooks():
     service = IntegrationAuthService(allow_legacy_bearer=False)
     service.register_token("token-a", credential())
@@ -171,3 +201,42 @@ def test_authorized_browser_session_can_manage_webhooks():
 
     assert response.status_code == 200
     assert response.json()["webhook"]["created_by"] == "browser-user"
+
+
+def test_authorized_integration_session_header_can_manage_webhooks():
+    service = IntegrationAuthService(allow_legacy_bearer=False)
+    service.register_session(
+        "session-a",
+        credential(principal_id="header-user"),
+    )
+    client = build_client(service)
+
+    response = post_webhook(
+        client,
+        headers={"x-integration-session": " session-a "},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["webhook"]["created_by"] == "header-user"
+
+
+def test_integration_session_header_takes_precedence_over_cookie():
+    service = IntegrationAuthService(allow_legacy_bearer=False)
+    service.register_session(
+        "cookie-session",
+        credential(principal_id="cookie-user", disabled=True),
+    )
+    service.register_session(
+        "header-session",
+        credential(principal_id="header-user"),
+    )
+    client = build_client(service)
+    client.cookies.set("ao_session", "cookie-session")
+
+    response = post_webhook(
+        client,
+        headers={"x-integration-session": "header-session"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["webhook"]["created_by"] == "header-user"

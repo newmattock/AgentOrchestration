@@ -126,6 +126,15 @@ class IntegrationAuthService:
                 )
             return "bearer", token.strip()
 
+        integration_session = request.headers.get("x-integration-session")
+        if integration_session is not None:
+            if not integration_session.strip():
+                raise IntegrationAuthError(
+                    401,
+                    "Malformed integration session header",
+                )
+            return "session", integration_session.strip()
+
         session_id = request.cookies.get("ao_session")
         if session_id:
             return "session", session_id
