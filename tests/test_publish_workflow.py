@@ -75,7 +75,7 @@ def test_guard_uses_actual_github_ref_context_not_dispatch_inputs():
     assert "${{ inputs.version }}" not in guard["run"]
 
 
-def test_guard_accepts_protected_branches_and_verified_signed_tags():
+def test_guard_accepts_only_release_branches_and_verified_signed_tags():
     guard_script = next(
         step["run"]
         for step in _steps(_load_workflow())
@@ -84,9 +84,15 @@ def test_guard_accepts_protected_branches_and_verified_signed_tags():
 
     assert '[ "${ACTUAL_REF_TYPE}" = "branch" ]' in guard_script
     assert '[ "${ACTUAL_REF_PROTECTED}" != "true" ]' in guard_script
+    assert 'main|release/*)' in guard_script
+    assert (
+        "Package publishing branches must be main or release/*."
+        in guard_script
+    )
     assert "publish_ref_kind=protected-branch" in guard_script
 
     assert '[ "${ACTUAL_REF_TYPE}" = "tag" ]' in guard_script
+    assert "vMAJOR.MINOR.PATCH release tag policy" in guard_script
     assert "/git/ref/tags/${ACTUAL_REF_NAME}" in guard_script
     assert "/git/tags/${tag_object_sha}" in guard_script
     assert ".verification.verified" in guard_script

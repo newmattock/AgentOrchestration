@@ -47,6 +47,14 @@ jobs:
               echo "::error::Package publishing must run from a protected branch or a verified signed tag."
               exit 64
             fi
+            case "${ACTUAL_REF_NAME}" in
+              main|release/*)
+                ;;
+              *)
+                echo "::error::Package publishing branches must be main or release/*."
+                exit 65
+                ;;
+            esac
 
             echo "publish_ref_kind=protected-branch" >> "${GITHUB_OUTPUT}"
             echo "publish_allowed=true" >> "${GITHUB_OUTPUT}"
@@ -54,18 +62,23 @@ jobs:
           fi
 
           if [ "${ACTUAL_REF_TYPE}" = "tag" ]; then
+            if [[ ! "${ACTUAL_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+              echo "::error::Package publishing tags must match vMAJOR.MINOR.PATCH release tag policy."
+              exit 66
+            fi
+
             tag_object_type="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${ACTUAL_REF_NAME}" --jq '.object.type')"
             tag_object_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${ACTUAL_REF_NAME}" --jq '.object.sha')"
 
             if [ "${tag_object_type}" != "tag" ]; then
               echo "::error::Package publishing tags must be annotated signed tags, not lightweight tags."
-              exit 65
+              exit 67
             fi
 
             tag_verified="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" --jq '.verification.verified')"
             if [ "${tag_verified}" != "true" ]; then
               echo "::error::Package publishing tag ${ACTUAL_REF_NAME} is not verified as signed."
-              exit 66
+              exit 68
             fi
 
             echo "publish_ref_kind=signed-tag" >> "${GITHUB_OUTPUT}"
@@ -74,7 +87,7 @@ jobs:
           fi
 
           echo "::error::Package publishing only supports protected branches and signed tags."
-          exit 67
+          exit 69
 
       - name: Set up Python
         if: steps.ref_guard.outputs.publish_allowed == 'true'
