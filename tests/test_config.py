@@ -1,5 +1,5 @@
 import pytest
-from src.common.config import Config
+from src.common.config import Config, MAX_CONFIG_FILE_BYTES
 
 
 class TestConfig:
@@ -9,6 +9,16 @@ class TestConfig:
         config = Config(str(config_file))
         assert config.get("app.name") == "test"
         assert config.get("app.port") == 8080
+
+    def test_load_rejects_oversized_config_before_parsing(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        config_file.write_bytes(b" " * (MAX_CONFIG_FILE_BYTES + 1))
+
+        with pytest.raises(
+            ValueError,
+            match="exceeds the maximum config size",
+        ):
+            Config(str(config_file))
 
     def test_default_value(self):
         config = Config()
