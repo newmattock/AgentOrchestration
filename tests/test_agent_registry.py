@@ -92,6 +92,23 @@ class TestAgentRegistry:
             for entry in self.registry.authorization_audit_log()
         )
 
+    def test_stopped_agent_rejects_cached_authorization(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"permissions": ["tasks.run"]},
+        )
+        assert self.registry.resolve_authorized(agent_id, "tasks.run")
+
+        assert self.registry.update_status(agent_id, AgentStatus.STOPPED)
+
+        assert self.registry.resolve_authorized(agent_id, "tasks.run") is None
+        assert any(
+            entry["reason"] == "inactive_lifecycle_state"
+            and entry["allowed"] is False
+            for entry in self.registry.authorization_audit_log()
+        )
+
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
         assert self.registry.delete(agent_id)

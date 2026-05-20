@@ -133,6 +133,7 @@ class AgentRegistry:
 
         if agent["status"] in {
             AgentStatus.FAILED.value,
+            AgentStatus.STOPPED.value,
             AgentStatus.TERMINATED.value,
         }:
             self._record_authorization_decision(
