@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,105 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_fail_requeues_retry_without_resetting_lifecycle(self):
+        task_id = self.scheduler.enqueue({"type": "test"}, priority=3)
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+
+        retried = asyncio.run(self.scheduler.dequeue())
+        assert retried["id"] == task_id
+        assert retried["retries"] == 1
+        assert retried["priority"] == 3
+
+    def test_duplicate_ack_during_retry_requeue_is_idempotent(self):
+        task_id = self.scheduler.enqueue({"type": "test"}, priority=3)
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        assert self.scheduler.fail(task["id"])
+
+        retried = asyncio.run(self.scheduler.dequeue())
+        assert retried["id"] == task_id
+        assert retried["retries"] == 1
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+        duplicate_records = [
+            record for record in self.scheduler.audit_records
+            if record["reason"] == "retry_already_queued"
+        ]
+        assert len(duplicate_records) == 1
+
+    def test_dead_letter_write_is_idempotent_for_ack_retry(self):
+        self.scheduler._max_retries = 1
+        task_id = self.scheduler.enqueue({
+            "type": "test",
+            "payload": {"secret": "not audited"},
+        })
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        assert self.scheduler.fail(task["id"])
+
+        dead_letter = self.scheduler.get_dead_letter(task_id)
+        assert dead_letter is not None
+        assert dead_letter["id"] == task_id
+        assert dead_letter["retries"] == 1
+        assert dead_letter["reason"] == "max_retries_exceeded"
+
+        dead_letter_records = [
+            record for record in self.scheduler.audit_records
+            if record["event"] == "dead_letter_written"
+        ]
+        duplicate_records = [
+            record for record in self.scheduler.audit_records
+            if record["event"] == "dead_letter_duplicate_ack"
+        ]
+        assert len(dead_letter_records) == 1
+        assert len(duplicate_records) == 1
+        assert all(
+            "payload" not in record for record in self.scheduler.audit_records
+        )
+
+    def test_dead_letter_write_failure_preserves_in_flight_state(
+        self, monkeypatch
+    ):
+        self.scheduler._max_retries = 1
+        task_id = self.scheduler.enqueue({
+            "type": "test",
+            "payload": {"secret": "not audited"},
+        })
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        def fail_write(task, queue, reason):
+            raise RuntimeError("dead-letter store unavailable")
+
+        monkeypatch.setattr(self.scheduler, "_write_dead_letter", fail_write)
+
+        assert not self.scheduler.fail(task["id"])
+        assert self.scheduler._in_flight[task_id] is task
+        assert task["retries"] == 0
+        assert self.scheduler.get_dead_letter(task_id) is None
+
+        deferred_records = [
+            record for record in self.scheduler.audit_records
+            if record["event"] == "dead_letter_deferred"
+        ]
+        assert deferred_records == [{
+            "event": "dead_letter_deferred",
+            "task_id": task_id,
+            "queue": "default",
+            "reason": "dead_letter_write_failed",
+            "timestamp": deferred_records[0]["timestamp"],
+        }]
+        assert all(
+            "payload" not in record for record in self.scheduler.audit_records
+        )
 
 # 2019-01-09T19:07:03 update
 

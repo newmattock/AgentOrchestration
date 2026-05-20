@@ -1,10 +1,12 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class PriorityQueue:
@@ -35,26 +37,87 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._dead_letters: Dict[str, Dict] = {}
+        self._retrying: Set[str] = set()
+        self._audit_records: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["queue"] = queue
+        task["priority"] = priority
 
+        self._push_to_queue(task, queue, priority)
+        return task_id
+
+    def _push_to_queue(self, task: Dict, queue: str, priority: int) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def _requeue_retry(self, task: Dict, queue: str) -> None:
+        task["queue"] = queue
+        task["enqueued_at"] = time.time()
+        self._retrying.add(task["id"])
+        self._push_to_queue(task, queue, task.get("priority", 0))
+
+    def _audit(
+        self, event: str, task_id: str, queue: str, reason: str
+    ) -> None:
+        record = {
+            "event": event,
+            "task_id": task_id,
+            "queue": queue,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        self._audit_records.append(record)
+        logger.info(
+            "%s task_id=%s queue=%s reason=%s",
+            event,
+            task_id,
+            queue,
+            reason,
+        )
+
+    def _write_dead_letter(self, task: Dict, queue: str, reason: str) -> bool:
+        task_id = task["id"]
+        if task_id in self._dead_letters:
+            self._audit("dead_letter_duplicate_ack", task_id, queue, reason)
+            return False
+
+        dead_letter = {
+            "id": task_id,
+            "type": task.get("type"),
+            "queue": queue,
+            "retries": task.get("retries", 0),
+            "reason": reason,
+            "dead_lettered_at": time.time(),
+        }
+        self._dead_letters[task_id] = dead_letter
+        self._audit("dead_letter_written", task_id, queue, reason)
+        return True
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self, queue: str = "default", timeout: float = 1.0
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,6 +128,7 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                self._retrying.discard(task["id"])
                 self._in_flight[task["id"]] = task
                 return task
         return None
@@ -73,13 +137,63 @@ class TaskScheduler:
         return self._in_flight.pop(task_id, None) is not None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
+        task = self._in_flight.get(task_id)
+        if task is None:
+            if task_id in self._dead_letters:
+                self._audit(
+                    "dead_letter_duplicate_ack",
+                    task_id,
+                    queue,
+                    "already_dead_lettered",
+                )
+                return True
+            if task_id in self._retrying:
+                self._audit(
+                    "dead_letter_duplicate_ack",
+                    task_id,
+                    queue,
+                    "retry_already_queued",
+                )
+                return True
+            return False
+
+        if task_id in self._dead_letters:
+            self._in_flight.pop(task_id, None)
+            self._audit(
+                "dead_letter_duplicate_ack",
+                task_id,
+                queue,
+                "already_dead_lettered",
+            )
+            return True
+
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._in_flight.pop(task_id, None)
+                self._requeue_retry(task, queue)
                 return True
+            try:
+                self._write_dead_letter(task, queue, "max_retries_exceeded")
+            except Exception:
+                task["retries"] -= 1
+                self._audit(
+                    "dead_letter_deferred",
+                    task_id,
+                    queue,
+                    "dead_letter_write_failed",
+                )
+                return False
+            self._in_flight.pop(task_id, None)
+            return True
         return False
+
+    def get_dead_letter(self, task_id: str) -> Optional[Dict]:
+        return self._dead_letters.get(task_id)
+
+    @property
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._audit_records)
 
 # 2019-04-25T08:37:12 update
 
