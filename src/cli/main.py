@@ -1,10 +1,29 @@
 """CLI entry point for the agent orchestrator."""
 
 import argparse
+import json
 import sys
-from typing import Callable, Optional, Sequence
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Sequence
 
+import yaml
+
+from src.common.config import Config
 from src.common.logging import configure_logging
+from src.sdk.client import OrchestratorClient
+
+
+SUCCESS = 0
+ERROR = 1
+USAGE_ERROR = 2
+
+
+class ManifestError(ValueError):
+    """Raised when a deploy manifest cannot be parsed as a mapping."""
+
+
+class ManifestReadError(OSError):
+    """Raised when a deploy manifest cannot be opened."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,50 +73,128 @@ def build_parser() -> argparse.ArgumentParser:
 
 def handle_init(args: argparse.Namespace) -> int:
     print(f"Initializing project: {args.name}")
-    return 0
+    return SUCCESS
 
 
-def deploy_manifest(manifest: str) -> None:
-    print(f"Deploying agent from manifest: {manifest}")
+def load_manifest(manifest: str) -> Dict[str, Any]:
+    path = Path(manifest)
+    try:
+        manifest_file = path.open(encoding="utf-8")
+    except OSError as exc:
+        raise ManifestReadError(str(exc)) from exc
+
+    with manifest_file:
+        if path.suffix.lower() in {".yaml", ".yml"}:
+            try:
+                data = yaml.safe_load(manifest_file)
+            except yaml.YAMLError as exc:
+                raise ManifestError(f"invalid YAML manifest: {exc}") from exc
+        else:
+            try:
+                data = json.load(manifest_file)
+            except json.JSONDecodeError as exc:
+                raise ManifestError(f"invalid JSON manifest: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ManifestError("manifest root must be a JSON/YAML object")
+    return data
+
+
+def deploy_manifest(
+    manifest: str,
+    config: Optional[Config] = None,
+    client_factory: Callable[..., OrchestratorClient] = OrchestratorClient,
+) -> Dict[str, Any]:
+    payload = load_manifest(manifest)
+    config = config or Config()
+    client = client_factory(
+        base_url=config.get("api.url"),
+        api_key=config.get("api.key"),
+    )
+    return client.deploy_agent(payload)
 
 
 def handle_deploy(
     args: argparse.Namespace,
-    deploy_backend: Optional[Callable[[str], None]] = None,
+    deploy_backend: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+    config: Optional[Config] = None,
+    client_factory: Callable[..., OrchestratorClient] = OrchestratorClient,
 ) -> int:
-    backend = deploy_backend or deploy_manifest
     try:
-        backend(args.manifest)
+        if deploy_backend is None:
+            result = deploy_manifest(
+                args.manifest,
+                config=config,
+                client_factory=client_factory,
+            )
+        else:
+            result = deploy_backend(args.manifest)
+    except ManifestReadError as exc:
+        print(
+            f"Deploy failed: could not read manifest: {exc}",
+            file=sys.stderr,
+        )
+        return USAGE_ERROR
+    except ManifestError as exc:
+        print(f"Deploy failed: {exc}", file=sys.stderr)
+        return USAGE_ERROR
     except Exception as exc:
         print(f"Deploy failed: {exc}", file=sys.stderr)
-        return 1
-    return 0
+        return ERROR
+
+    if isinstance(result, dict) and result.get("error"):
+        detail = result.get("message") or result["error"]
+        print(
+            f"Deploy failed: orchestrator rejected deployment: {detail}",
+            file=sys.stderr,
+        )
+        return ERROR
+
+    deployment_id = result.get("id") if isinstance(result, dict) else None
+    if deployment_id:
+        print(f"Deploy succeeded: {deployment_id}")
+    else:
+        print(f"Deploying agent from manifest: {args.manifest}")
+    return SUCCESS
 
 
 def handle_status(args: argparse.Namespace) -> int:
     print("Checking agent status...")
-    return 0
+    return SUCCESS
 
 
 def handle_logs(args: argparse.Namespace) -> int:
     print(f"Fetching logs for agent: {args.agent_id}")
-    return 0
+    return SUCCESS
 
 
-def dispatch_command(args: argparse.Namespace) -> int:
+def dispatch_command(
+    args: argparse.Namespace,
+    config: Optional[Config] = None,
+    client_factory: Callable[..., OrchestratorClient] = OrchestratorClient,
+) -> int:
     handlers = {
         "init": handle_init,
-        "deploy": handle_deploy,
         "status": handle_status,
         "logs": handle_logs,
     }
+    if args.command == "deploy":
+        return handle_deploy(
+            args,
+            config=config,
+            client_factory=client_factory,
+        )
+
     handler = handlers.get(args.command)
     if handler is None:
-        return 1
+        return USAGE_ERROR
     return handler(args)
 
 
-def cli(argv: Optional[Sequence[str]] = None) -> int:
+def cli(
+    argv: Optional[Sequence[str]] = None,
+    client_factory: Callable[..., OrchestratorClient] = OrchestratorClient,
+) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -108,9 +205,14 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.command is None:
         parser.print_help()
-        return 1
+        return USAGE_ERROR
 
-    return dispatch_command(args)
+    config = Config(args.config)
+    return dispatch_command(
+        args,
+        config=config,
+        client_factory=client_factory,
+    )
 
 
 if __name__ == "__main__":
