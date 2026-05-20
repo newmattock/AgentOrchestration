@@ -1,5 +1,6 @@
 from src.orchestrator.scheduler import TaskScheduler
 from src.orchestrator.engine import OrchestrationEngine
+from src.common.metrics import metrics
 
 
 class TestTaskScheduler:
@@ -61,6 +62,8 @@ class TestTaskScheduler:
             agent_id,
             ["deploy"],
         )
+        metric_name = "scheduler.dispatch.deferred.stale_worker_capabilities"
+        before_count = metrics.snapshot()["counters"].get(metric_name, 0)
 
         import asyncio
         task = asyncio.run(engine.scheduler.dequeue())
@@ -78,6 +81,8 @@ class TestTaskScheduler:
             "allowed": False,
             "reason": "stale_worker_capabilities",
         }
+        after_count = metrics.snapshot()["counters"].get(metric_name, 0)
+        assert after_count == before_count + 1
         assert "payload" not in engine.dispatch_decisions[-1]
 
 # 2019-01-09T19:07:03 update

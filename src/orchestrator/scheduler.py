@@ -5,6 +5,8 @@ import time
 from typing import Any, Callable, Dict, Optional, Tuple
 from uuid import uuid4
 
+from src.common.metrics import metrics
+
 
 class PriorityQueue:
     def __init__(self):
@@ -100,8 +102,10 @@ class TaskScheduler:
                 }
                 self._record_decision(task, reason, allowed)
                 if not allowed:
+                    metrics.increment(f"scheduler.dispatch.deferred.{reason}")
                     self._deferred[task["id"]] = task
                     return None
+                metrics.increment("scheduler.dispatch.accepted")
                 self._retrying.discard(task["id"])
                 self._in_flight[task["id"]] = task
                 return task
