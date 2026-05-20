@@ -92,6 +92,38 @@ class TestAgentRegistry:
         audit_text = str(self.registry.audit_records())
         assert "set_disabled" in audit_text
 
+    def test_disabled_agent_rejects_runnable_transition_safely(self):
+        agent_id = self.registry.register(
+            "disabled-agent",
+            "worker.processor",
+            {"enabled": False, "token": "secret-token"},
+        )
+
+        assert not self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.PENDING.value
+        assert agent["enabled"] is False
+
+        audit_text = str(self.registry.audit_records())
+        assert "status_transition_rejected" in audit_text
+        assert AgentStatus.RUNNING.value in audit_text
+        assert "secret-token" not in audit_text
+
+    def test_stopped_agent_status_cannot_be_reactivated(self):
+        agent_id = self.registry.register("stopped-agent", "worker.processor")
+
+        assert self.registry.update_status(agent_id, AgentStatus.STOPPED)
+        assert not self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.STOPPED.value
+        assert self.registry.resolve(agent_id) is None
+
+        audit_text = str(self.registry.audit_records())
+        assert "status_disabled" in audit_text
+        assert "status_transition_rejected" in audit_text
+
     def test_update_status(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
         assert self.registry.update_status(agent_id, AgentStatus.RUNNING)

@@ -24,6 +24,10 @@ class AgentRegistry:
         AgentStatus.FAILED.value,
         AgentStatus.TERMINATED.value,
     }
+    RUNNABLE_STATUSES = {
+        AgentStatus.PENDING.value,
+        AgentStatus.RUNNING.value,
+    }
 
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
@@ -107,11 +111,21 @@ class AgentRegistry:
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
         if agent_id not in self._agents:
             return False
-        self._agents[agent_id]["status"] = status.value
-        self._agents[agent_id]["updated_at"] = time.time()
+        agent = self._agents[agent_id]
+        if self._is_disabled(agent) and status.value in self.RUNNABLE_STATUSES:
+            self._record_decision(
+                "status_transition_rejected",
+                agent,
+                requested_status=status.value,
+            )
+            metrics.increment("registry.status.transition_rejected")
+            return False
+
+        agent["status"] = status.value
+        agent["updated_at"] = time.time()
         self._invalidate_list_cache()
         if status.value in self.DISABLED_STATUSES:
-            self._record_decision("status_disabled", self._agents[agent_id])
+            self._record_decision("status_disabled", agent)
             metrics.increment("registry.status.disabled")
         return True
 
@@ -164,14 +178,21 @@ class AgentRegistry:
             or config.get("disabled") is True
         )
 
-    def _record_decision(self, reason: str, agent: Dict[str, Any]) -> None:
-        self._audit_records.append({
+    def _record_decision(
+        self,
+        reason: str,
+        agent: Dict[str, Any],
+        **metadata: Any,
+    ) -> None:
+        record = {
             "reason": reason,
             "agent_id": agent["id"],
             "agent_type": agent["type"],
             "status": agent["status"],
             "timestamp": time.time(),
-        })
+        }
+        record.update(metadata)
+        self._audit_records.append(record)
 
     def _record_listing_filter(
         self,
