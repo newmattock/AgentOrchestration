@@ -2,52 +2,116 @@
 
 import time
 import logging
-from typing import Callable
+from typing import Callable, Dict, List
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
         return await call_next(request)
 
 
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, max_requests: int = 100, window: int = 60):
-        super().__init__(app)
+class RateLimitMiddleware:
+    def __init__(
+        self,
+        app: ASGIApp,
+        max_requests: int = 100,
+        window: int = 60,
+    ):
+        self.app = app
         self.max_requests = max_requests
         self.window = window
-        self._requests = {}
+        self._requests: Dict[str, List[float]] = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        client_ip = request.client.host if request.client else "unknown"
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        state = scope.setdefault("state", {})
+        client = scope.get("client")
+        client_ip = client[0] if client else "unknown"
         now = time.time()
+        timestamps = [
+            timestamp
+            for timestamp in self._requests.get(client_ip, [])
+            if now - timestamp < self.window
+        ]
+        self._requests[client_ip] = timestamps
 
-        if client_ip not in self._requests:
-            self._requests[client_ip] = []
+        try:
+            if len(timestamps) >= self.max_requests:
+                retry_after = self.window
+                if timestamps:
+                    retry_after = max(
+                        1,
+                        int(self.window - (now - timestamps[0])),
+                    )
+                state["rate_limit"] = {"allowed": False}
+                logger.warning(
+                    "rate limit rejected before body parsing path=%s",
+                    scope.get("path", ""),
+                )
+                response = Response(
+                    status_code=429,
+                    content="Too many requests",
+                    headers={
+                        "Retry-After": str(retry_after),
+                        "X-RateLimit-Limit": str(self.max_requests),
+                        "X-RateLimit-Remaining": "0",
+                        "X-RateLimit-Decision": "limited",
+                    },
+                )
+                await response(scope, receive, send)
+                return
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
-
-        if len(self._requests[client_ip]) >= self.max_requests:
-            return Response(status_code=429, content="Too many requests")
-
-        self._requests[client_ip].append(now)
-        return await call_next(request)
+            timestamps.append(now)
+            state["rate_limit"] = {
+                "allowed": True,
+                "remaining": max(0, self.max_requests - len(timestamps)),
+            }
+            await self.app(scope, receive, send)
+        finally:
+            state.pop("rate_limit", None)
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
