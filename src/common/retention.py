@@ -52,6 +52,27 @@ class DeletionCompletion:
     completed_at: float = field(default_factory=time.time)
 
 
+@dataclass(frozen=True)
+class StoreDeletionVerification:
+    store: str
+    data_class: str
+    remaining_ids: List[str]
+
+    @property
+    def complete(self) -> bool:
+        return not self.remaining_ids
+
+
+@dataclass(frozen=True)
+class DeletionVerification:
+    completion: DeletionCompletion
+    stores: List[StoreDeletionVerification]
+
+    @property
+    def complete(self) -> bool:
+        return all(store.complete for store in self.stores)
+
+
 class InMemoryRetentionStore:
     """Small store contract used by retention workflow tests and adapters."""
 
@@ -161,6 +182,32 @@ class RetentionDeletionWorkflow:
             )
 
         return DeletionCompletion(manifest=manifest, stores=completions)
+
+    def verify_completion(
+        self,
+        completion: DeletionCompletion,
+    ) -> DeletionVerification:
+        verifications = []
+
+        for entry in completion.manifest.entries:
+            store = self._stores[entry.store]
+            remaining_ids = sorted(
+                record_id
+                for record_id in entry.record_ids
+                if store.has(record_id)
+            )
+            verifications.append(
+                StoreDeletionVerification(
+                    store=entry.store,
+                    data_class=entry.data_class,
+                    remaining_ids=remaining_ids,
+                )
+            )
+
+        return DeletionVerification(
+            completion=completion,
+            stores=verifications,
+        )
 
     def reconcile_stale_derived_records(
         self,

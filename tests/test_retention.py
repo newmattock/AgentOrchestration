@@ -77,6 +77,7 @@ def test_apply_manifest_is_idempotent_and_records_missing_ids():
     workflow, artifacts, embeddings, _indexes = make_workflow()
     artifacts.add("artifact-1", "workspace-a", source_id="task-1")
     embeddings.add("embedding-1", "workspace-a", source_id="artifact-1")
+    embeddings.add("embedding-live", "workspace-a", source_id="artifact-live")
     manifest = workflow.build_manifest("workspace-a", ["task-1"])
 
     first_completion = workflow.apply_manifest(manifest)
@@ -90,6 +91,48 @@ def test_apply_manifest_is_idempotent_and_records_missing_ids():
         store.missing_ids
         for store in second_completion.stores
     ] == [["artifact-1"], ["embedding-1"], []]
+    assert embeddings.has("embedding-live")
+
+
+def test_verify_completion_reports_no_manifest_records_remaining():
+    workflow, artifacts, embeddings, indexes = make_workflow()
+    artifacts.add("artifact-1", "workspace-a", source_id="task-1")
+    embeddings.add("embedding-1", "workspace-a", source_id="artifact-1")
+    indexes.add("index-1", "workspace-a", source_id="artifact-1")
+
+    completion = workflow.delete_workspace_task_data("workspace-a", ["task-1"])
+    verification = workflow.verify_completion(completion)
+
+    assert verification.complete
+    assert [
+        (store.store, store.data_class, store.remaining_ids)
+        for store in verification.stores
+    ] == [
+        ("artifact_store", PRIMARY_ARTIFACTS, []),
+        ("embedding_store", DERIVED_EMBEDDINGS, []),
+        ("vector_index", DERIVED_INDEXES, []),
+    ]
+
+
+def test_verify_completion_detects_stale_manifest_record_left_behind():
+    workflow, artifacts, embeddings, _indexes = make_workflow()
+    artifacts.add("artifact-1", "workspace-a", source_id="task-1")
+    embeddings.add("embedding-1", "workspace-a", source_id="artifact-1")
+    manifest = workflow.build_manifest("workspace-a", ["task-1"])
+    completion = workflow.apply_manifest(manifest)
+    embeddings.add("embedding-1", "workspace-a", source_id="artifact-1")
+
+    verification = workflow.verify_completion(completion)
+
+    assert not verification.complete
+    assert {
+        store.data_class: store.remaining_ids
+        for store in verification.stores
+    } == {
+        PRIMARY_ARTIFACTS: [],
+        DERIVED_EMBEDDINGS: ["embedding-1"],
+        DERIVED_INDEXES: [],
+    }
 
 
 def test_reconcile_stale_derived_records_removes_orphans_only():
