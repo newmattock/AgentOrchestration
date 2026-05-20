@@ -1,5 +1,6 @@
 """Webhook delivery logging helpers with safe redaction."""
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
@@ -29,6 +30,22 @@ INTERNAL_ONLY_FIELDS = {
     "raw_headers",
     "signing_secret",
 }
+
+SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?P<key>[A-Za-z0-9_-]*"
+    r"(?:authorization|cookie|password|secret|signature|token|api[_-]?key)"
+    r"[A-Za-z0-9_-]*)"
+    r"(?P<sep>\s*[=:]\s*)"
+    r"(?P<value>Bearer\s+[^&\s,;]+|[^&\s,;]+)",
+    re.IGNORECASE,
+)
+
+TOKEN_VALUE_RE = re.compile(
+    r"(?P<bearer>Bearer\s+)[A-Za-z0-9._\-+/=]+|"
+    r"\b(?:sk|pk|ghp|github_pat|mch)_[A-Za-z0-9_\-]{8,}\b|"
+    r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -316,8 +333,28 @@ def redact_webhook_payload(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_webhook_payload(item) for item in value]
     if isinstance(value, str):
-        return _redact_url_query(value)
+        redacted_url = _redact_url_query(value)
+        if redacted_url != value:
+            return redacted_url
+        return redact_webhook_text(value)
     return value
+
+
+def redact_webhook_text(value: str) -> str:
+    value = SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: (
+            f"{match.group('key')}{match.group('sep')}{REDACTED}"
+        ),
+        value,
+    )
+
+    def redact_token(match: re.Match[str]) -> str:
+        bearer_prefix = match.group("bearer")
+        if bearer_prefix:
+            return f"{bearer_prefix}{REDACTED}"
+        return REDACTED
+
+    return TOKEN_VALUE_RE.sub(redact_token, value)
 
 
 def contains_private_fields(value: Any, private_values: Iterable[str]) -> bool:

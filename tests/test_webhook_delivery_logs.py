@@ -1,5 +1,10 @@
+import json
+import logging
+import sys
+
 import pytest
 
+from src.common.logging import StructuredFormatter
 from src.common.webhooks import (
     REDACTED,
     WebhookDeliveryLogs,
@@ -256,3 +261,52 @@ def test_url_query_secrets_are_redacted_in_logs_and_callbacks():
     )
     assert "retry-token-1" not in record.payload["delivery_url"]
     assert "Bearer" not in record.callback["retry_url"]
+
+
+def test_free_form_secret_text_is_redacted_from_delivery_logs():
+    redacted = redact_webhook_payload(
+        {
+            "message": (
+                "failed token=sk_live_message_secret123456 "
+                "authorization: Bearer abcdefghijklmnopqrstuvwxyz"
+            ),
+            "errors": [
+                "webhook_secret=sk_live_nested_secret123456",
+                "safe text",
+            ],
+        },
+    )
+
+    rendered = json.dumps(redacted)
+    assert REDACTED in rendered
+    assert "message_secret" not in rendered
+    assert "abcdefghijklmnopqrstuvwxyz" not in rendered
+    assert "nested_secret" not in rendered
+    assert redacted["errors"][1] == "safe text"
+
+
+def test_structured_formatter_redacts_secret_text_and_exceptions():
+    formatter = StructuredFormatter()
+    record = logging.LogRecord(
+        "tests.webhook",
+        logging.ERROR,
+        __file__,
+        1,
+        "dispatch failed token=%s",
+        ("sk_live_message_secret123456",),
+        None,
+    )
+
+    try:
+        raise RuntimeError(
+            "webhook_secret=sk_live_exception_secret123456"
+        )
+    except RuntimeError:
+        record.exc_info = sys.exc_info()
+
+    formatted = json.loads(formatter.format(record))
+
+    assert REDACTED in formatted["message"]
+    assert "message_secret" not in formatted["message"]
+    assert REDACTED in formatted["exception"]
+    assert "exception_secret" not in formatted["exception"]
