@@ -3,7 +3,7 @@
 import os
 from typing import Dict
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
@@ -21,18 +21,19 @@ def create_app(config: Dict = None) -> FastAPI:
     )
 
     app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","),
+    )
+    app.add_middleware(AuthMiddleware)
+    app.add_middleware(RateLimitMiddleware)
+    app.add_middleware(LoggingMiddleware)
+    app.add_middleware(
         CORSMiddleware,
         allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","))
-
-    app.add_middleware(AuthMiddleware)
-    app.add_middleware(RateLimitMiddleware)
-    app.add_middleware(LoggingMiddleware)
 
     app.include_router(router, prefix="/api/v2")
 

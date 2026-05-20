@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
 from src.api.middleware import AUTH_DECISION_HEADER, AuthMiddleware
+from src.api.server import create_app
 
 
 def build_app(seen):
@@ -170,3 +171,54 @@ def test_token_route_skips_auth():
     assert response.json() == {"token": "issued"}
     assert AUTH_DECISION_HEADER not in response.headers
     assert not hasattr(seen["token_state"], "auth_context")
+
+
+def test_create_app_preflight_stays_outside_auth():
+    client = TestClient(create_app())
+
+    response = client.options(
+        "/api/v2/agents",
+        headers={
+            "Origin": "https://client.example",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == (
+        "https://client.example"
+    )
+    assert AUTH_DECISION_HEADER not in response.headers
+
+
+def test_create_app_rejected_cors_request_keeps_cors_headers():
+    client = TestClient(create_app())
+
+    response = client.get(
+        "/api/v2/agents",
+        headers={"Origin": "https://client.example"},
+    )
+
+    assert response.status_code == 401
+    assert response.headers[AUTH_DECISION_HEADER] == "rejected"
+    assert response.headers["access-control-allow-origin"] == (
+        "https://client.example"
+    )
+
+
+def test_create_app_authenticated_cors_request_reaches_handler():
+    client = TestClient(create_app())
+
+    response = client.get(
+        "/api/v2/agents",
+        headers={
+            "Origin": "https://client.example",
+            "Authorization": "Bearer test-token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers[AUTH_DECISION_HEADER] == "accepted"
+    assert response.headers["access-control-allow-origin"] == (
+        "https://client.example"
+    )
