@@ -10,7 +10,12 @@ from typing import Iterable
 
 
 FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+DOCKER_DIGEST_RE = re.compile(r"^docker://.+@sha256:[0-9a-fA-F]{64}$")
 USES_RE = re.compile(r"^\s*-?\s*uses:\s*[\"']?([^\"'\s#]+)")
+GITHUB_ACTIONS_RE = re.compile(
+    r"package-ecosystem:\s*[\"']?github-actions[\"']?"
+)
+ROOT_DIRECTORY_RE = re.compile(r"directory:\s*[\"']?/[\"']?")
 
 
 def workflow_files(root: Path) -> Iterable[Path]:
@@ -26,11 +31,31 @@ def workflow_files(root: Path) -> Iterable[Path]:
 
 
 def is_external_action(reference: str) -> bool:
-    return not (
-        reference.startswith("./")
-        or reference.startswith("../")
-        or reference.startswith("docker://")
-    )
+    return not (reference.startswith("./") or reference.startswith("../"))
+
+
+def is_pinned_action(reference: str) -> bool:
+    if reference.startswith("docker://"):
+        return bool(DOCKER_DIGEST_RE.fullmatch(reference))
+    if "@" not in reference:
+        return False
+    ref = reference.rsplit("@", 1)[1]
+    return bool(FULL_SHA_RE.fullmatch(ref))
+
+
+def dependabot_config_violations(root: Path) -> list[str]:
+    dependabot = root / ".github" / "dependabot.yml"
+    if not dependabot.exists():
+        return [f"{dependabot}: missing GitHub Actions update automation"]
+
+    content = dependabot.read_text()
+    has_github_actions = GITHUB_ACTIONS_RE.search(content)
+    has_root_directory = ROOT_DIRECTORY_RE.search(content)
+    if not has_github_actions or not has_root_directory:
+        return [
+            f"{dependabot}: missing github-actions updates for directory '/'"
+        ]
+    return []
 
 
 def mutable_action_refs(root: Path) -> list[str]:
@@ -44,17 +69,16 @@ def mutable_action_refs(root: Path) -> list[str]:
             reference = match.group(1)
             if not is_external_action(reference):
                 continue
-            if "@" not in reference:
+            if not is_pinned_action(reference):
+                if "@" not in reference:
+                    violations.append(
+                        f"{workflow}:{line_number}: external action has no "
+                        f"ref: {reference}"
+                    )
+                    continue
                 violations.append(
-                    f"{workflow}:{line_number}: external action has no ref: "
-                    f"{reference}"
-                )
-                continue
-            action, ref = reference.rsplit("@", 1)
-            if not FULL_SHA_RE.fullmatch(ref):
-                violations.append(
-                    f"{workflow}:{line_number}: {action}@{ref} is not pinned "
-                    "to a full commit SHA"
+                    f"{workflow}:{line_number}: {reference} is not pinned to "
+                    "an immutable commit SHA or Docker digest"
                 )
     return violations
 
@@ -71,7 +95,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    violations = mutable_action_refs(Path(args.root))
+    root = Path(args.root)
+    violations = mutable_action_refs(root)
+    violations.extend(dependabot_config_violations(root))
     if violations:
         print("Mutable GitHub Actions references found:", file=sys.stderr)
         for violation in violations:
