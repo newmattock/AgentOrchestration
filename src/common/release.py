@@ -1,7 +1,12 @@
 """Release manifest validation helpers."""
 
+import re
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
+
+
+SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+PASSING_STATUSES = {"ok", "pass", "passed", "success", "successful", "true"}
 
 
 class ManifestValidationError(ValueError):
@@ -12,8 +17,8 @@ class ManifestValidationError(ValueError):
 class ArchitectureImageValidation:
     architecture: str
     digest: str
-    tests_passed: Optional[bool]
-    scan_passed: Optional[bool]
+    tests_passed: Any
+    scan_passed: Any
 
 
 @dataclass(frozen=True)
@@ -61,12 +66,18 @@ def create_multi_arch_release_manifest(
             "at least one architecture is required for manifest publication"
         )
 
+    required_architecture_set = set(required_order)
     validations_by_architecture: Dict[str, ArchitectureImageValidation] = {}
     for validation in validations:
         architecture = validation.architecture.strip()
         if not architecture:
             raise ManifestValidationError(
                 "architecture-specific validation is missing an architecture"
+            )
+        if architecture not in required_architecture_set:
+            raise ManifestValidationError(
+                f"unexpected architecture in release validation: "
+                f"{architecture}"
             )
         if architecture in validations_by_architecture:
             raise ManifestValidationError(
@@ -103,15 +114,21 @@ def _validate_architecture_result(
     validation: ArchitectureImageValidation,
 ) -> None:
     architecture = validation.architecture.strip()
-    if not validation.digest.startswith("sha256:"):
+    if not SHA256_DIGEST_RE.fullmatch(validation.digest):
         raise ManifestValidationError(
             f"{architecture} is missing a validated sha256 digest"
         )
-    if validation.tests_passed is not True:
+    if not _is_passing_validation(validation.tests_passed):
         raise ManifestValidationError(
             f"{architecture} is missing a passing test result"
         )
-    if validation.scan_passed is not True:
+    if not _is_passing_validation(validation.scan_passed):
         raise ManifestValidationError(
             f"{architecture} is missing a passing scan result"
         )
+
+
+def _is_passing_validation(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in PASSING_STATUSES

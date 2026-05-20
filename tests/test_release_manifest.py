@@ -47,6 +47,34 @@ def test_multi_arch_manifest_includes_only_validated_digests():
     }
 
 
+def test_multi_arch_manifest_accepts_common_passing_status_strings():
+    manifest = create_multi_arch_release_manifest(
+        [
+            ArchitectureImageValidation(
+                architecture="linux/amd64",
+                digest="sha256:" + "a" * 64,
+                tests_passed="passed",
+                scan_passed="success",
+            ),
+            ArchitectureImageValidation(
+                architecture="linux/arm64",
+                digest="sha256:" + "b" * 64,
+                tests_passed="ok",
+                scan_passed=True,
+            ),
+        ],
+        REQUIRED_ARCHITECTURES,
+    )
+
+    architectures = [
+        item["architecture"] for item in manifest.as_manifest()["manifests"]
+    ]
+    assert architectures == [
+        "linux/amd64",
+        "linux/arm64",
+    ]
+
+
 def test_missing_architecture_result_fails_manifest_publication():
     with pytest.raises(
         ManifestValidationError,
@@ -57,6 +85,69 @@ def test_missing_architecture_result_fails_manifest_publication():
                 ArchitectureImageValidation(
                     architecture="linux/amd64",
                     digest="sha256:" + "a" * 64,
+                    tests_passed=True,
+                    scan_passed=True,
+                ),
+            ],
+            REQUIRED_ARCHITECTURES,
+        )
+
+
+def test_unexpected_architecture_fails_manifest_publication():
+    with pytest.raises(
+        ManifestValidationError,
+        match="unexpected architecture.*linux/s390x",
+    ):
+        create_multi_arch_release_manifest(
+            [
+                ArchitectureImageValidation(
+                    architecture="linux/amd64",
+                    digest="sha256:" + "a" * 64,
+                    tests_passed=True,
+                    scan_passed=True,
+                ),
+                ArchitectureImageValidation(
+                    architecture="linux/arm64",
+                    digest="sha256:" + "b" * 64,
+                    tests_passed=True,
+                    scan_passed=True,
+                ),
+                ArchitectureImageValidation(
+                    architecture="linux/s390x",
+                    digest="sha256:" + "c" * 64,
+                    tests_passed=True,
+                    scan_passed=True,
+                ),
+            ],
+            REQUIRED_ARCHITECTURES,
+        )
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "",
+        "latest",
+        "sha256:abc",
+        "sha256:" + "g" * 64,
+    ],
+)
+def test_malformed_sha256_digest_fails_release(digest):
+    with pytest.raises(
+        ManifestValidationError,
+        match="validated sha256 digest",
+    ):
+        create_multi_arch_release_manifest(
+            [
+                ArchitectureImageValidation(
+                    architecture="linux/amd64",
+                    digest=digest,
+                    tests_passed=True,
+                    scan_passed=True,
+                ),
+                ArchitectureImageValidation(
+                    architecture="linux/arm64",
+                    digest="sha256:" + "b" * 64,
                     tests_passed=True,
                     scan_passed=True,
                 ),
