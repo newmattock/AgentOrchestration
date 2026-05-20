@@ -73,6 +73,54 @@ class TestTaskScheduler:
         assert "customer@example.com" not in repr(summary)
         assert "live-key" not in repr(summary)
 
+    def test_dead_letter_view_summarizes_scalar_payloads_safely(self):
+        self.scheduler._max_retries = 1
+        task_id = self.scheduler.enqueue({
+            "type": "webhook",
+            "payload": "Bearer secret-token for customer@example.com",
+        })
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(task["id"])
+
+        [summary] = self.scheduler.list_dead_letters()
+        assert summary["id"] == task_id
+        assert summary["payload_summary"] == {"type": "str"}
+        assert "payload" not in summary
+        assert "secret-token" not in repr(summary)
+        assert "customer@example.com" not in repr(summary)
+
+    def test_dead_letter_view_summarizes_array_payload_items_safely(self):
+        self.scheduler._max_retries = 1
+        task_id = self.scheduler.enqueue({
+            "type": "batch",
+            "payload": [
+                {"email": "customer@example.com", "status": "failed"},
+                {"api_key": "live-key", "operation": "retry"},
+                "Bearer secret-token",
+                {"password": "p@ssw0rd"},
+            ],
+        })
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(task["id"])
+
+        [summary] = self.scheduler.list_dead_letters()
+        payload_summary = summary["payload_summary"]
+        assert summary["id"] == task_id
+        assert payload_summary["type"] == "list"
+        assert payload_summary["length"] == 4
+        assert len(payload_summary["items"]) == 3
+        assert payload_summary["items"][0]["email"] == {"type": "str"}
+        assert payload_summary["items"][1]["api_key"] == "[redacted]"
+        assert payload_summary["items"][2] == {"type": "str"}
+        assert "payload" not in summary
+        assert "customer@example.com" not in repr(summary)
+        assert "live-key" not in repr(summary)
+        assert "secret-token" not in repr(summary)
+
     def test_raw_dead_letter_access_requires_actor_and_reason(self):
         self.scheduler._max_retries = 1
         task_id = self.scheduler.enqueue({
