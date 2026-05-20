@@ -71,6 +71,22 @@ def test_deploy_dry_run_rejects_missing_manifest(monkeypatch, capsys):
     assert "manifest does not exist" in captured.err
 
 
+def test_deploy_rejects_missing_manifest_before_progress(monkeypatch, capsys):
+    def fail_deploy(_manifest_path, _manifest):
+        raise AssertionError("deploy backend should not run for invalid input")
+
+    monkeypatch.setattr(cli_main, "deploy_manifest", fail_deploy)
+
+    result = cli_main.cli(["deploy", "missing.yaml"])
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert captured.out == ""
+    assert "Deploying agent" not in captured.out
+    assert "Deploy validation failed" in captured.err
+    assert "manifest does not exist" in captured.err
+
+
 def test_deploy_dry_run_rejects_directory(tmp_path, monkeypatch, capsys):
     def fail_deploy(_manifest_path, _manifest):
         raise AssertionError("deploy backend should not run for invalid input")
