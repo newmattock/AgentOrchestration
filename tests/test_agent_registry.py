@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -33,6 +32,65 @@ class TestAgentRegistry:
         self.registry.register("agent-2", "monitor.watcher")
         workers = self.registry.list(group="worker")
         assert len(workers) == 1
+
+    def test_list_omits_config_disabled_agents_by_default(self):
+        disabled_id = self.registry.register(
+            "disabled-agent",
+            "worker.processor",
+            {"enabled": False, "api_key": "secret-token"},
+        )
+        active_id = self.registry.register("active-agent", "worker.processor")
+
+        visible_ids = {agent["id"] for agent in self.registry.list()}
+        assert active_id in visible_ids
+        assert disabled_id not in visible_ids
+
+        all_ids = {
+            agent["id"]
+            for agent in self.registry.list(include_disabled=True)
+        }
+        assert {active_id, disabled_id} <= all_ids
+
+        audit_text = str(self.registry.audit_records())
+        assert "list_filtered_disabled" in audit_text
+        assert "secret-token" not in audit_text
+
+    def test_resolve_rejects_stopped_agent_without_leaking_config(self):
+        disabled_id = self.registry.register(
+            "disabled-agent",
+            "worker.processor",
+            {"disabled": True, "password": "private"},
+        )
+        stopped_id = self.registry.register("stopped-agent", "worker.analyzer")
+        active_id = self.registry.register("active-agent", "worker.processor")
+
+        assert self.registry.update_status(stopped_id, AgentStatus.STOPPED)
+
+        assert self.registry.resolve(disabled_id) is None
+        assert self.registry.resolve(stopped_id) is None
+        assert self.registry.resolve(active_id)["id"] == active_id
+
+        workers = self.registry.list(group="worker")
+        assert [agent["id"] for agent in workers] == [active_id]
+
+        audit_text = str(self.registry.audit_records())
+        assert "status_disabled" in audit_text
+        assert "resolve_disabled" in audit_text
+        assert "private" not in audit_text
+
+    def test_disabling_agent_invalidates_listing_cache(self):
+        agent_id = self.registry.register("active-agent", "worker.processor")
+        assert [
+            agent["id"] for agent in self.registry.list(group="worker")
+        ] == [agent_id]
+
+        assert self.registry.set_enabled(agent_id, False)
+
+        assert self.registry.list(group="worker") == []
+        assert self.registry.resolve(agent_id) is None
+
+        audit_text = str(self.registry.audit_records())
+        assert "set_disabled" in audit_text
 
     def test_update_status(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
