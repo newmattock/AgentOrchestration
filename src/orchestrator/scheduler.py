@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 
@@ -31,43 +30,177 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, time_fn: Optional[Callable[[], float]] = None):
+        self._time_fn = time_fn or time.time
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._audit_records: List[Dict[str, Any]] = []
+        self._dispatch_metrics: Dict[str, int] = {
+            "blackout_deferrals": 0,
+        }
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
+        task["enqueued_at"] = self._time_fn()
         task["retries"] = 0
+        task["priority"] = priority
 
+        self._queue_task(task, queue, priority)
+        return task_id
+
+    def _queue_task(self, task: Dict, queue: str, priority: int) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["enqueued_at"] = self._time_fn()
+        task["retries"] = 0
+        task["priority"] = priority
+        self._scheduled[task_id] = {
+            "task": task,
+            "ready_at": self._time_fn() + delay,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        now = self._time_fn()
+        self._promote_ready_scheduled(queue, now)
 
         if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
+            deferred: List[Dict] = []
+            while len(self._queues[queue]) > 0:
+                task = self._queues[queue].pop()
+                if not task:
+                    continue
+                blackout = self._active_blackout(task, now)
+                if blackout:
+                    self._record_blackout(task, queue, blackout)
+                    deferred.append(task)
+                    continue
+
+                for deferred_task in deferred:
+                    self._queue_task(
+                        deferred_task,
+                        queue,
+                        deferred_task.get("priority", 0),
+                    )
                 self._in_flight[task["id"]] = task
                 return task
+
+            for deferred_task in deferred:
+                self._queue_task(
+                    deferred_task,
+                    queue,
+                    deferred_task.get("priority", 0),
+                )
         return None
+
+    def _promote_ready_scheduled(self, queue: str, now: float) -> None:
+        ready_ids = [
+            task_id
+            for task_id, entry in self._scheduled.items()
+            if entry["queue"] == queue and entry["ready_at"] <= now
+        ]
+        for task_id in ready_ids:
+            entry = self._scheduled[task_id]
+            task = entry["task"]
+            blackout = self._active_blackout(task, now)
+            if blackout:
+                self._record_blackout(task, queue, blackout)
+                entry["ready_at"] = blackout[1]
+                continue
+            self._scheduled.pop(task_id, None)
+            self._queue_task(task, queue, entry["priority"])
+
+    def _active_blackout(
+        self,
+        task: Dict,
+        now: float,
+    ) -> Optional[Tuple[float, float]]:
+        for start, end in self._blackout_windows(task):
+            if start <= now < end:
+                return start, end
+        return None
+
+    def _blackout_windows(self, task: Dict) -> List[Tuple[float, float]]:
+        policy = task.get("dispatch_policy") or {}
+        workflow = task.get("workflow") or {}
+        workflow_policy = workflow.get("dispatch_policy") or {}
+        candidates = (
+            workflow_policy.get("blackout_windows")
+            or workflow.get("blackout_windows")
+            or policy.get("blackout_windows")
+            or task.get("blackout_windows")
+            or []
+        )
+        windows: List[Tuple[float, float]] = []
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                start = self._float_or_none(candidate.get("start"))
+                end = self._float_or_none(candidate.get("end"))
+            elif isinstance(candidate, (list, tuple)) and len(candidate) == 2:
+                start = self._float_or_none(candidate[0])
+                end = self._float_or_none(candidate[1])
+            else:
+                continue
+            if start is not None and end is not None and start < end:
+                windows.append((start, end))
+        return windows
+
+    def _float_or_none(self, value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _record_blackout(
+        self,
+        task: Dict,
+        queue: str,
+        blackout: Tuple[float, float],
+    ) -> None:
+        self._dispatch_metrics["blackout_deferrals"] += 1
+        self._audit_records.append(
+            {
+                "event": "dispatch_deferred_blackout",
+                "task_id": task.get("id"),
+                "queue": queue,
+                "window_start": blackout[0],
+                "window_end": blackout[1],
+                "reason": "workflow_blackout_window",
+            }
+        )
+
+    @property
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._audit_records)
+
+    @property
+    def dispatch_metrics(self) -> Dict[str, int]:
+        return dict(self._dispatch_metrics)
 
     def complete(self, task_id: str) -> bool:
         return self._in_flight.pop(task_id, None) is not None
@@ -77,7 +210,7 @@ class TaskScheduler:
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._queue_task(task, queue, priority=task.get("priority", 0))
                 return True
         return False
 

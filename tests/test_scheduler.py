@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,77 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_dequeue_defers_workflow_during_blackout_window(self):
+        now = 100.0
+        scheduler = TaskScheduler(time_fn=lambda: now)
+        task_id = scheduler.enqueue(
+            {
+                "type": "dispatch",
+                "payload": {"secret": "not-for-audit"},
+                "workflow": {
+                    "dispatch_policy": {
+                        "blackout_windows": [{"start": 90, "end": 120}],
+                    },
+                },
+            },
+            priority=10,
+        )
+
+        import asyncio
+        assert asyncio.run(scheduler.dequeue()) is None
+        assert scheduler.dispatch_metrics["blackout_deferrals"] == 1
+        assert scheduler.audit_records == [
+            {
+                "event": "dispatch_deferred_blackout",
+                "task_id": task_id,
+                "queue": "default",
+                "window_start": 90.0,
+                "window_end": 120.0,
+                "reason": "workflow_blackout_window",
+            }
+        ]
+        assert "secret" not in str(scheduler.audit_records)
+
+    def test_dequeue_dispatches_after_blackout_window(self):
+        current_time = {"value": 100.0}
+        scheduler = TaskScheduler(time_fn=lambda: current_time["value"])
+        task_id = scheduler.enqueue(
+            {
+                "type": "dispatch",
+                "workflow": {"blackout_windows": [{"start": 90, "end": 120}]},
+            }
+        )
+
+        import asyncio
+        assert asyncio.run(scheduler.dequeue()) is None
+        current_time["value"] = 121.0
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["type"] == "dispatch"
+
+    def test_scheduled_task_waits_until_blackout_window_expires(self):
+        current_time = {"value": 100.0}
+        scheduler = TaskScheduler(time_fn=lambda: current_time["value"])
+        task_id = scheduler.schedule(
+            {
+                "type": "scheduled-dispatch",
+                "dispatch_policy": {"blackout_windows": [(90, 120)]},
+            },
+            delay=0,
+        )
+
+        import asyncio
+        assert asyncio.run(scheduler.dequeue()) is None
+        assert scheduler.dispatch_metrics["blackout_deferrals"] == 1
+        current_time["value"] = 120.0
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["type"] == "scheduled-dispatch"
 
 # 2019-01-09T19:07:03 update
 
