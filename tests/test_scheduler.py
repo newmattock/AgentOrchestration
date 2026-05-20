@@ -1,4 +1,6 @@
-import pytest
+import asyncio
+
+import src.orchestrator.scheduler as scheduler_module
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +14,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +21,148 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_schedule_due_task_preserves_task_payload(self, monkeypatch):
+        now = [50.0]
+        monkeypatch.setattr(scheduler_module.time, "time", lambda: now[0])
+        self.scheduler.schedule({"type": "delayed"}, delay=5.0)
+
+        assert asyncio.run(self.scheduler.dequeue(timeout=0)) is None
+        now[0] = 55.0
+        task = asyncio.run(self.scheduler.dequeue(timeout=0))
+
+        assert task["type"] == "delayed"
+        assert task["scheduled_for"] == 55.0
+
+    def test_visibility_extension_keeps_task_in_flight(self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr(scheduler_module.time, "time", lambda: now[0])
+        scheduler = TaskScheduler(visibility_timeout=1.0)
+        scheduler.enqueue({"type": "long-running-agent"})
+
+        task = asyncio.run(scheduler.dequeue())
+        assert task["visibility_deadline"] == 101.0
+
+        now[0] = 100.5
+        assert scheduler.extend_visibility_timeout(
+            task["id"],
+            5.0,
+            expected_version=0,
+        )
+        assert task["visibility_deadline"] == 106.0
+        assert task["visibility_version"] == 1
+
+        now[0] = 101.2
+        assert asyncio.run(scheduler.dequeue(timeout=0)) is None
+        assert scheduler.visibility_deadline(task["id"]) == 106.0
+        assert scheduler._in_flight[task["id"]] is task
+        assert scheduler.visibility_audit[-1]["reason"] == "long_running_agent"
+
+    def test_stale_visibility_extension_is_rejected(self, monkeypatch):
+        now = [200.0]
+        monkeypatch.setattr(scheduler_module.time, "time", lambda: now[0])
+        scheduler = TaskScheduler(visibility_timeout=2.0)
+        scheduler.enqueue({"type": "long-running-agent"})
+
+        task = asyncio.run(scheduler.dequeue())
+        assert scheduler.extend_visibility_timeout(
+            task["id"],
+            4.0,
+            expected_version=0,
+        )
+        deadline = task["visibility_deadline"]
+
+        now[0] = 201.0
+        assert not scheduler.extend_visibility_timeout(
+            task["id"],
+            3.0,
+            expected_version=0,
+        )
+        assert task["visibility_deadline"] == deadline
+        assert task["visibility_version"] == 1
+        assert scheduler.visibility_audit[-1]["reason"] == "stale_version"
+
+    def test_visibility_extension_is_idempotent_by_key(self, monkeypatch):
+        now = [250.0]
+        monkeypatch.setattr(scheduler_module.time, "time", lambda: now[0])
+        scheduler = TaskScheduler(visibility_timeout=2.0)
+        scheduler.enqueue({"type": "long-running-agent"})
+
+        task = asyncio.run(scheduler.dequeue())
+        assert scheduler.extend_visibility_timeout(
+            task["id"],
+            4.0,
+            idempotency_key="heartbeat-1",
+        )
+        deadline = task["visibility_deadline"]
+
+        now[0] = 251.0
+        assert scheduler.extend_visibility_timeout(
+            task["id"],
+            4.0,
+            idempotency_key="heartbeat-1",
+        )
+        assert task["visibility_deadline"] == deadline
+        assert task["visibility_version"] == 1
+        assert scheduler.visibility_audit[-1]["action"] == "idempotent"
+
+    def test_visibility_extension_rejects_key_conflict(self, monkeypatch):
+        now = [275.0]
+        monkeypatch.setattr(scheduler_module.time, "time", lambda: now[0])
+        scheduler = TaskScheduler(visibility_timeout=2.0)
+        scheduler.enqueue({"type": "long-running-agent"})
+
+        task = asyncio.run(scheduler.dequeue())
+        assert scheduler.extend_visibility(
+            task["id"],
+            4.0,
+            idempotency_key="heartbeat-1",
+        )
+        deadline = task["visibility_deadline"]
+
+        assert not scheduler.extend_visibility(
+            task["id"],
+            5.0,
+            idempotency_key="heartbeat-1",
+        )
+        assert task["visibility_deadline"] == deadline
+        assert task["visibility_version"] == 1
+        assert (
+            scheduler.visibility_audit[-1]["reason"]
+            == "idempotency_conflict"
+        )
+
+    def test_expired_visibility_requeues_with_audit(self, monkeypatch):
+        now = [300.0]
+        monkeypatch.setattr(scheduler_module.time, "time", lambda: now[0])
+        scheduler = TaskScheduler(visibility_timeout=1.0)
+        scheduler.enqueue({
+            "type": "long-running-agent",
+            "payload": {"secret": "x"},
+        })
+
+        task = asyncio.run(scheduler.dequeue())
+        now[0] = 301.1
+        redelivered = asyncio.run(scheduler.dequeue(timeout=0))
+
+        assert redelivered is task
+        assert redelivered["id"] == task["id"]
+        assert redelivered["visibility_deadline"] == 302.1
+        assert scheduler.visibility_audit[-1]["action"] == "defer"
+        assert scheduler.visibility_audit[-1]["reason"] == "visibility_expired"
+        assert "payload" not in scheduler.visibility_audit[-1]
 
 # 2019-01-09T19:07:03 update
 

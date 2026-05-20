@@ -1,6 +1,5 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
 from typing import Any, Dict, Optional
@@ -31,55 +30,230 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, visibility_timeout: float = 30.0):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._visibility_timeout = visibility_timeout
+        self._visibility_records: Dict[str, Dict] = {}
+        self.visibility_audit = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["queue"] = queue
+        task["priority"] = priority
 
+        self._push(task, queue, priority)
+        return task_id
+
+    def _push(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["queue"] = queue
+        task["priority"] = priority
+        task["scheduled_for"] = time.time() + delay
+        self._scheduled[task_id] = {
+            "due_at": task["scheduled_for"],
+            "task": task,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        self._requeue_expired_visibility(now, queue)
+
+        expired = [
+            tid for tid, entry in self._scheduled.items()
+            if entry["due_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
+            task = self._scheduled.pop(tid)["task"]
             if task:
-                self.enqueue(task, queue)
+                self._push(
+                    task,
+                    task.get("queue", queue),
+                    task.get("priority", 0),
+                )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                deadline = now + self._visibility_timeout
+                task["visibility_deadline"] = deadline
+                task["visibility_version"] = 0
                 self._in_flight[task["id"]] = task
+                self._visibility_records[task["id"]] = {
+                    "deadline": deadline,
+                    "version": 0,
+                    "queue": queue,
+                    "priority": task.get("priority", 0),
+                }
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
+        self._visibility_records.pop(task_id, None)
         return self._in_flight.pop(task_id, None) is not None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
+        self._visibility_records.pop(task_id, None)
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._push(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def extend_visibility_timeout(
+        self,
+        task_id: str,
+        extension_seconds: float,
+        expected_version: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> bool:
+        record = self._visibility_records.get(task_id)
+        task = self._in_flight.get(task_id)
+        if extension_seconds <= 0:
+            self._record_visibility_decision(
+                task_id,
+                "reject",
+                "invalid_extension",
+            )
+            return False
+        if record is None or task is None:
+            self._record_visibility_decision(
+                task_id,
+                "reject",
+                "not_in_flight",
+            )
+            return False
+        extensions = record.setdefault("extensions", {})
+        if idempotency_key and idempotency_key in extensions:
+            stored = extensions[idempotency_key]
+            if stored["extension_seconds"] != extension_seconds:
+                self._record_visibility_decision(
+                    task_id,
+                    "reject",
+                    "idempotency_conflict",
+                )
+                return False
+            self._record_visibility_decision(
+                task_id,
+                "idempotent",
+                "duplicate_extension",
+            )
+            return True
+        if (
+            expected_version is not None
+            and expected_version != record["version"]
+        ):
+            self._record_visibility_decision(
+                task_id,
+                "reject",
+                "stale_version",
+            )
+            return False
+
+        deadline = max(record["deadline"], time.time()) + extension_seconds
+        version = record["version"] + 1
+        record["deadline"] = deadline
+        record["version"] = version
+        task["visibility_deadline"] = deadline
+        task["visibility_version"] = version
+        if idempotency_key:
+            extensions[idempotency_key] = {
+                "deadline": deadline,
+                "version": version,
+                "extension_seconds": extension_seconds,
+            }
+            task["visibility_extensions"] = dict(extensions)
+        self._record_visibility_decision(
+            task_id,
+            "extend",
+            "long_running_agent",
+        )
+        return True
+
+    def extend_visibility(
+        self,
+        task_id: str,
+        extension: float,
+        idempotency_key: Optional[str] = None,
+    ) -> bool:
+        return self.extend_visibility_timeout(
+            task_id,
+            extension,
+            idempotency_key=idempotency_key,
+        )
+
+    def visibility_deadline(self, task_id: str) -> Optional[float]:
+        record = self._visibility_records.get(task_id)
+        return record["deadline"] if record else None
+
+    def _requeue_expired_visibility(self, now: float, queue: str) -> None:
+        expired = [
+            task_id
+            for task_id, record in self._visibility_records.items()
+            if record["queue"] == queue and record["deadline"] <= now
+        ]
+        for task_id in expired:
+            record = self._visibility_records.pop(task_id)
+            task = self._in_flight.pop(task_id, None)
+            if task is None:
+                continue
+            task.pop("visibility_deadline", None)
+            task.pop("visibility_version", None)
+            self._record_visibility_decision(
+                task_id,
+                "defer",
+                "visibility_expired",
+            )
+            self._push(task, record["queue"], record["priority"])
+
+    def _record_visibility_decision(
+        self,
+        task_id: str,
+        action: str,
+        reason: str,
+    ) -> None:
+        self.visibility_audit.append(
+            {
+                "task_id": task_id,
+                "action": action,
+                "reason": reason,
+                "timestamp": time.time(),
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 
