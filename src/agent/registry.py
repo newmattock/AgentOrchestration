@@ -1,10 +1,12 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
+import logging
 import time
 import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class AgentStatus(Enum):
@@ -16,13 +18,36 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+ROUTABLE_STATUSES = {AgentStatus.RUNNING.value, AgentStatus.PAUSED.value}
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._resolution_cache: Dict[str, str] = {}
+        self._audit_log: List[Dict[str, Any]] = []
+        self._health_metrics: Dict[str, int] = {
+            "handler_resolution_cache_hits": 0,
+            "handler_resolution_cache_misses": 0,
+            "handler_resolution_rejections": 0,
+            "handler_resolution_successes": 0,
+        }
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
+        config = dict(config or {})
+        health = config.get("health", {})
+        if isinstance(health, str):
+            health = {"status": health}
+        elif not isinstance(health, dict):
+            health = {}
+
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -30,22 +55,32 @@ class AgentRegistry:
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": config,
+            "health": {
+                "status": health.get("status", "healthy"),
+                "checked_at": health.get("checked_at", timestamp),
+                "reason": health.get("reason"),
+            },
             "created_at": timestamp,
             "updated_at": timestamp,
-            "version": "1.0.0",
+            "version": config.get("version", "1.0.0"),
             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
         }
         group = agent_type.split(".")[0]
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._invalidate_route_cache(group=group, agent_type=agent_type)
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -59,7 +94,97 @@ class AgentRegistry:
             return False
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate_route_cache(agent_id=agent_id)
         return True
+
+    def update_health(
+        self,
+        agent_id: str,
+        status: str,
+        reason: Optional[str] = None,
+        checked_at: Optional[float] = None,
+    ) -> bool:
+        if agent_id not in self._agents:
+            return False
+
+        self._agents[agent_id]["health"] = {
+            "status": status,
+            "checked_at": checked_at or time.time(),
+            "reason": reason,
+        }
+        self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate_route_cache(agent_id=agent_id)
+        return True
+
+    def resolve_handler(
+        self,
+        agent_type: str,
+        capability: Optional[str] = None,
+        version: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        cache_key = self._route_cache_key(agent_type, capability, version)
+        cached_agent_id = self._resolution_cache.get(cache_key)
+        if cached_agent_id:
+            cached_agent = self._agents.get(cached_agent_id)
+            if cached_agent and self._is_routable(
+                cached_agent,
+                capability,
+                version,
+            ):
+                self._health_metrics["handler_resolution_cache_hits"] += 1
+                self._record_route_decision(
+                    cached_agent,
+                    "accepted",
+                    "cache_hit",
+                )
+                return cached_agent
+            self._resolution_cache.pop(cache_key, None)
+
+        self._health_metrics["handler_resolution_cache_misses"] += 1
+        for agent in self._agents.values():
+            if not self._matches_route(agent, agent_type):
+                continue
+            if self._is_routable(agent, capability, version):
+                self._resolution_cache[cache_key] = agent["id"]
+                self._health_metrics["handler_resolution_successes"] += 1
+                self._record_route_decision(agent, "accepted", "healthy")
+                return agent
+
+        self._health_metrics["handler_resolution_rejections"] += 1
+        self._record_route_decision(
+            {"id": None, "type": agent_type},
+            "rejected",
+            "no_healthy_handler",
+            capability=capability,
+            version=version,
+        )
+        return None
+
+    def resolve_agent(
+        self,
+        agent_id: str,
+        capability: Optional[str] = None,
+        version: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        agent = self._agents.get(agent_id)
+        if not agent:
+            self._health_metrics["handler_resolution_rejections"] += 1
+            self._record_route_decision(
+                {"id": agent_id, "type": None},
+                "rejected",
+                "missing_handler",
+                capability=capability,
+                version=version,
+            )
+            return None
+
+        if not self._is_routable(agent, capability, version):
+            self._health_metrics["handler_resolution_rejections"] += 1
+            return None
+
+        self._health_metrics["handler_resolution_successes"] += 1
+        self._record_route_decision(agent, "accepted", "healthy")
+        return agent
 
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
@@ -68,10 +193,129 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._invalidate_route_cache(
+            agent_id=agent_id,
+            group=group,
+            agent_type=agent["type"],
+        )
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def audit_log(self) -> List[Dict[str, Any]]:
+        return list(self._audit_log)
+
+    def health_metrics(self) -> Dict[str, int]:
+        return dict(self._health_metrics)
+
+    def _route_cache_key(
+        self,
+        agent_type: str,
+        capability: Optional[str],
+        version: Optional[str],
+    ) -> str:
+        return "|".join([agent_type, capability or "*", version or "*"])
+
+    def _matches_route(self, agent: Dict[str, Any], agent_type: str) -> bool:
+        return (
+            agent["type"] == agent_type
+            or agent["type"].split(".")[0] == agent_type
+        )
+
+    def _is_routable(
+        self,
+        agent: Dict[str, Any],
+        capability: Optional[str],
+        version: Optional[str],
+    ) -> bool:
+        if agent["status"] not in ROUTABLE_STATUSES:
+            self._record_route_decision(agent, "rejected", "not_routable")
+            return False
+
+        config = agent.get("config", {})
+        health = agent.get("health", {})
+        if health.get("status") != "healthy":
+            self._record_route_decision(agent, "rejected", "unhealthy")
+            return False
+        if config.get("draining"):
+            self._record_route_decision(agent, "rejected", "draining")
+            return False
+        if config.get("disabled"):
+            self._record_route_decision(agent, "rejected", "disabled")
+            return False
+        if config.get("accepting_tasks") is False:
+            self._record_route_decision(
+                agent,
+                "rejected",
+                "not_accepting_tasks",
+            )
+            return False
+        capabilities = set(config.get("capabilities", []))
+        if capability and capability not in capabilities:
+            self._record_route_decision(
+                agent,
+                "rejected",
+                "missing_capability",
+                capability=capability,
+            )
+            return False
+        if version and agent.get("version") != version:
+            self._record_route_decision(
+                agent,
+                "rejected",
+                "version_mismatch",
+                version=version,
+            )
+            return False
+        return True
+
+    def _invalidate_route_cache(
+        self,
+        agent_id: Optional[str] = None,
+        group: Optional[str] = None,
+        agent_type: Optional[str] = None,
+    ) -> None:
+        if agent_id:
+            cached_keys = [
+                key
+                for key, cached_agent_id in self._resolution_cache.items()
+                if cached_agent_id == agent_id
+            ]
+        else:
+            cached_keys = [
+                key
+                for key in self._resolution_cache
+                if (agent_type and key.startswith(f"{agent_type}|"))
+                or (group and key.startswith(f"{group}|"))
+            ]
+
+        for key in cached_keys:
+            self._resolution_cache.pop(key, None)
+
+    def _record_route_decision(
+        self,
+        agent: Dict[str, Any],
+        decision: str,
+        reason: str,
+        capability: Optional[str] = None,
+        version: Optional[str] = None,
+    ) -> None:
+        record = {
+            "agent_id": agent.get("id"),
+            "agent_type": agent.get("type"),
+            "decision": decision,
+            "reason": reason,
+            "capability": capability,
+            "version": version,
+            "timestamp": time.time(),
+        }
+        self._audit_log.append(record)
+        logger.info(
+            "handler routing %s: %s",
+            decision,
+            {k: v for k, v in record.items() if k != "timestamp"},
+        )
 
 # 2019-01-29T11:24:49 update
 

@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -39,6 +38,96 @@ class TestAgentRegistry:
         assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
         agent = self.registry.get(agent_id)
         assert agent["status"] == "running"
+
+    def test_resolve_handler_requires_running_healthy_handler(self):
+        agent_id = self.registry.register(
+            "deploy-agent",
+            "worker.processor",
+            {
+                "capabilities": ["deploy"],
+                "token": "private-token-value",
+                "version": "2.0.0",
+            },
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        resolved = self.registry.resolve_handler(
+            "worker.processor",
+            capability="deploy",
+        )
+        assert resolved["id"] == agent_id
+
+        assert self.registry.update_health(
+            agent_id,
+            "unhealthy",
+            reason="rolling_deploy_probe_failed",
+        )
+
+        assert self.registry.resolve_handler(
+            "worker.processor",
+            capability="deploy",
+        ) is None
+        assert self.registry.get(agent_id)["status"] == "running"
+
+        audit_log = self.registry.audit_log()
+        assert any(record["reason"] == "unhealthy" for record in audit_log)
+        assert "private-token-value" not in str(audit_log)
+        assert (
+            self.registry.health_metrics()["handler_resolution_rejections"]
+            == 1
+        )
+
+    def test_resolve_handler_invalidates_cache_on_lifecycle_change(self):
+        stale_id = self.registry.register("stale-agent", "worker.processor")
+        replacement_id = self.registry.register(
+            "replacement-agent",
+            "worker.processor",
+        )
+        assert self.registry.update_status(stale_id, AgentStatus.RUNNING)
+        assert self.registry.update_status(replacement_id, AgentStatus.RUNNING)
+
+        resolved = self.registry.resolve_handler("worker.processor")
+        assert resolved["id"] == stale_id
+        assert self.registry.update_status(stale_id, AgentStatus.STOPPED)
+
+        resolved = self.registry.resolve_handler("worker.processor")
+        assert resolved["id"] == replacement_id
+        assert self.registry.get(stale_id)["status"] == "stopped"
+
+    def test_resolve_handler_rejects_draining_handlers(self):
+        agent_id = self.registry.register(
+            "draining-agent",
+            "worker.processor",
+            {"accepting_tasks": False},
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        assert self.registry.resolve_handler("worker.processor") is None
+
+        audit_log = self.registry.audit_log()
+        assert any(
+            record["reason"] == "not_accepting_tasks"
+            for record in audit_log
+        )
+
+    def test_resolve_handler_rejects_missing_capability_safely(self):
+        agent_id = self.registry.register(
+            "metrics-agent",
+            "worker.processor",
+            {"capabilities": ["metrics"], "api_key": "secret-value"},
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        assert self.registry.resolve_handler(
+            "worker.processor",
+            capability="deploy",
+        ) is None
+
+        audit_log = self.registry.audit_log()
+        assert any(
+            record["reason"] == "missing_capability"
+            for record in audit_log
+        )
+        assert "secret-value" not in str(audit_log)
 
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
