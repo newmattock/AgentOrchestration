@@ -34,11 +34,13 @@ class TestConfig:
     def test_runtime_ao_variables_do_not_enter_config_tree(self, monkeypatch):
         monkeypatch.setenv("AO_AGENT_ID", "runtime-agent")
         monkeypatch.setenv("AO_API_KEY", "secret-key")
+        monkeypatch.setenv("AO_API_URL", "https://runtime.example.test")
 
         config = Config()
 
         assert config.get("agent.id") is None
         assert config.get("api.key") is None
+        assert config.get("api.url") is None
         assert config.to_dict() == {}
 
     def test_scoped_config_env_override_is_imported(self, monkeypatch):
@@ -57,6 +59,7 @@ class TestConfig:
     ):
         config_file = tmp_path / "config.json"
         config_file.write_text('{"app": {"name": "from-file"}}')
+        monkeypatch.setenv("AO_APP_NAME", "legacy-unscoped")
         monkeypatch.setenv("AO_CONFIG_APP_NAME", "from-env")
 
         config = Config(str(config_file))
