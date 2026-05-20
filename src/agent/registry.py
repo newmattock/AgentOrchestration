@@ -1,6 +1,5 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
@@ -22,7 +21,12 @@ class AgentRegistry:
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -31,6 +35,7 @@ class AgentRegistry:
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
             "config": config or {},
+            "config_version": 1,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -45,7 +50,11 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -60,6 +69,34 @@ class AgentRegistry:
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
         return True
+
+    def update_config_if_version(
+        self,
+        agent_id: str,
+        config: Dict[str, Any],
+        expected_version: int,
+    ) -> Optional[Dict[str, Any]]:
+        agent = self._agents.get(agent_id)
+        if not agent:
+            return None
+
+        current_version = int(agent.get("config_version", 1))
+        if current_version != expected_version:
+            return {
+                "updated": False,
+                "current_version": current_version,
+                "agent": agent,
+            }
+
+        next_version = current_version + 1
+        agent["config"] = dict(config)
+        agent["config_version"] = next_version
+        agent["updated_at"] = time.time()
+        return {
+            "updated": True,
+            "current_version": next_version,
+            "agent": agent,
+        }
 
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
